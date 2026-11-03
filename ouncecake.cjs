@@ -6,14 +6,18 @@ const { attachGame } = require('./engine/session.cjs');
 const { discoverGames } = require('./engine/content.cjs');
 const { prepareGame } = require('./engine/mounts.cjs');
 const { deployFtp, readImage } = require('./engine/ftp.cjs');
+const { packNup } = require('./engine/nup.cjs');
 
-const USAGE = 'Usage: node poundcake.cjs <run-directory> [title-id] [--port 2121]\n' +
+const USAGE = 'Usage: node ouncecake.cjs <run-directory> [title-id] [--port 2121] [--nup <out.nup> --ip <switch 2 ip>]\n' +
               'Use the run dir given by ns2jb (Run folder: <whatever>)\n' +
-              'You can also provide a title ID to skip the selection menu and just mount a specific game\n';
+              'You can also provide a title ID to skip the selection menu and just mount a specific game\n' +
+              'With --nup, OunceCake downloads everything itself and writes a .nup instead of leaving the FTP up\n';
 
 function getArgs(argv) {
   const args = [];
   let port = 2121;
+  let nup;
+  let ip;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -27,6 +31,18 @@ function getArgs(argv) {
       if (!Number.isInteger(port) || port < 1024 || port > 65535) {
         throw new Error('Invalid --port value\n' + USAGE);
       }
+      continue;
+    }
+
+    if (a === '--nup') {
+      nup = argv[++i];
+      if (!nup || nup.startsWith('--')) throw new Error('--nup needs an output file\n' + USAGE);
+      continue;
+    }
+
+    if (a === '--ip') {
+      ip = argv[++i];
+      if (!ip || !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) throw new Error('--ip needs an IPv4 address\n' + USAGE);
       continue;
     }
 
@@ -45,8 +61,12 @@ function getArgs(argv) {
     throw new Error('You need to add a run directory\n' + USAGE);
   }
 
+  if (Boolean(nup) !== Boolean(ip)) {
+    throw new Error('--nup and --ip go together (OunceCake needs your Switch 2\'s IP to download from it)\n' + USAGE);
+  }
+
   const title = args.length === 2 ? titleId(args[1]) : undefined;
-  return { run: path.resolve(args[0]), title, port };
+  return { run: path.resolve(args[0]), title, port, nup: nup && path.resolve(nup), ip };
 }
 
 const storageNames = { 2: 'Game card', 4: 'Internal', 5: 'SD' };
@@ -117,8 +137,9 @@ async function main(argv = process.argv.slice(2)) {
     return;
   }
   const image = await readImage();
-  const { port, run } = options;
+  const { port, run, nup, ip } = options;
   let { title } = options;
+  let name;
   const cancellation = new AbortController();
   const stop = () => cancellation.abort();
   process.once('SIGINT', stop);
@@ -132,10 +153,18 @@ async function main(argv = process.argv.slice(2)) {
       const selected = await pickGame(await discoverGames({ ...attachment, shouldStop }), cancellation.signal);
       if (!selected || shouldStop()) return;
       title = selected.title;
+      name = selected.name;
     }
-    const prepared = await prepareGame({ attachment, title, shouldStop });
+    const prepared = await prepareGame({ attachment, title, images: Boolean(nup), shouldStop });
     if (shouldStop()) return;
     server = await deployFtp({ attachment, image, ...prepared, port });
+
+    if (nup) {
+      console.log('FTP up, downloading into ' + nup);
+      await packNup({ host: ip, port, views: prepared.views, title, name, output: nup, shouldStop });
+      return;
+    }
+
     console.log('FTP up! ftp://<switch 2 ip>:' + port);
     console.log('Ctrl-C to stop the server');
     

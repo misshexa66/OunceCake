@@ -16,6 +16,8 @@ static int equal(const char *a,const char *b) {u64 i=0;while(a[i]&&a[i]==b[i])i+
 static int same(const void *a,const void *b,u64 n) {const u8 *x=a,*y=b;for(u64 i=0;i<n;i++)if(x[i]!=y[i])return 0;return 1;}
 static u16 swap16(u16 n) {return (n>>8)|(n<<8);}
 static int transient(FtpConfig *c) {int e=c->functions->get_errno();return e==4||e==11||e==35;}
+// nagle + the client's delayed ack was holding every "226" back ~40ms, which murders small file downloads
+static void no_delay(FtpConfig *c,int fd) {if(c->functions->setsockopt) {int one=1;c->functions->setsockopt(fd,6,1,&one,4);}}
 
 typedef struct {
     FtpConfig *c;
@@ -195,7 +197,7 @@ static int data_accept(Client *p) {
         Address address={0};u32 size=16;int fd=f->accept(p->passive,&address,&size);
         if(fd<0)continue;
         if(size!=16||address.family!=2||address.address!=p->peer.address) {f->close(fd);continue;}
-        passive_close(p);return fd;
+        no_delay(c,fd);passive_close(p);return fd;
     }
     passive_close(p);return -1;
 }
@@ -420,6 +422,7 @@ void *ftp_main(void *configuration) {
         int ready=wait_fd(c,fd,1,1);if(ready<0) {c->result=BAD;break;}if(!ready)continue;
         Address peer={0};u32 bytes=16;int client=f->accept(fd,&peer,&bytes);
         if(client<0)continue;
+        no_delay(c,client);
         ClientSlot *slot=0;
         for(u32 i=0;i<c->reserved;i++) {
             ClientSlot *candidate=(ClientSlot *)(c->slots+i*c->slot_bytes);

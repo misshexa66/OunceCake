@@ -45,6 +45,10 @@ const wanted = {
   fcntl: '_ZN2nn6socket5FcntlEiiz',
   get_errno: '_ZN2nn6socket12GetLastErrnoEv',
 };
+// nice to have, the server still works without these
+const optional = {
+  setsockopt: '_ZN2nn6socket10SetSockOptEiiiPKvj',
+};
 
 function integer(value) {
   checkSdk(value <= BigInt(Number.MAX_SAFE_INTEGER), 'imprecise address');
@@ -93,7 +97,7 @@ async function resolveSdkFunctions({ read, query, base }) {
 
   const strings = await exact(address(tags.get(5)), stringBytes);
   const symbols = await exact(address(tags.get(6)), count * 24);
-  const names = new Map(Object.entries(wanted).map(([key, name]) => [name, key]));
+  const names = new Map(Object.entries({ ...wanted, ...optional }).map(([key, name]) => [name, key]));
   const result = {};
 
   for (let i = 0; i < count; i++) {
@@ -134,7 +138,7 @@ async function resolveSdkFunctions({ read, query, base }) {
     result[key] = location;
   }
 
-  checkSdk(Object.keys(result).length === names.size, 'required socket exports are missing');
+  checkSdk(Object.keys(wanted).every((key) => result[key]), 'required socket exports are missing');
   return result;
 }
 
@@ -270,7 +274,7 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
       base: a.live.sdk,
     });
 
-    const functions = Buffer.alloc(15 * 8);
+    const functions = Buffer.alloc(16 * 8);
     Object.keys(wanted).forEach((name, i) => {
       functions.writeBigUInt64LE(BigInt(symbols[name]), i * 8);
     });
@@ -279,6 +283,7 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
     functions.writeBigUInt64LE(BigInt(a.live.sdk + sdk.close.offset), 12 * 8);
     functions.writeBigUInt64LE(BigInt(a.live.sdk + threadCode.create.offset), 13 * 8);
     functions.writeBigUInt64LE(BigInt(a.live.sdk + threadCode.join.offset), 14 * 8);
+    functions.writeBigUInt64LE(BigInt(symbols.setsockopt || 0), 15 * 8);
 
     const configuration = encodeConfiguration({
       base: work.base,
@@ -345,7 +350,11 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
       if (current.state === 1) break;
 
       if (current.state === 3) {
-        throw new Error('Native FTP startup failed: 0x' + current.result.toString(16));
+        throw new Error(
+          'Native FTP startup failed: 0x' + current.result.toString(16) +
+            '\nIs port ' + port + ' still taken? An earlier OunceCake server that wasn\'t stopped with Ctrl-C ' +
+            'keeps running until the game is closed. Try another --port.',
+        );
       }
 
       await new Promise((r) => setTimeout(r, 50));

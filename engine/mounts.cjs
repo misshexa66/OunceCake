@@ -317,7 +317,8 @@ const checkIndex = (ok, why) => {
   if (!ok) throw new Error('Invalid FTP index: ' + why);
 };
 
-function buildIndex(views) {
+// images: also expose every romfs as one big file (<prefix>/romfs.img) so it can be pulled in one go
+function buildIndex(views, { images = false } = {}) {
   const nodes = [{ path: '/', name: '', parent: 0, type: 'directory', children: [] }];
   const byPath = new Map([['/', 0]]);
   const entries = new Set();
@@ -405,6 +406,25 @@ function buildIndex(views) {
       byPath.set(filename, id);
       nodes[parent].children.push(id);
     }
+
+    if (images && view.kind !== 'filesystem') {
+      const filename = prefix + '.img';
+      checkIndex(!byPath.has(filename), 'image path collision');
+      const parent = byPath.get(path.posix.dirname(filename));
+      const id = nodes.length;
+      nodes.push({
+        path: filename,
+        name: path.posix.basename(filename),
+        parent,
+        type: 'file',
+        mount: view.mount,
+        offset: 0,
+        size: view.size,
+        sourcePath: view.kind === 'deferred-storage' ? view.source.contentPath : '',
+      });
+      byPath.set(filename, id);
+      nodes[parent].children.push(id);
+    }
   }
 
   for (const node of nodes) {
@@ -451,7 +471,7 @@ function buildIndex(views) {
   return bytes;
 }
 
-async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
+async function prepareGame({ attachment: a, title, images = false, shouldStop = () => false }) {
   const views = [];
   const sources = [];
   const absentSources = [];
@@ -561,6 +581,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
       mount,
       kind: deferred ? 'deferred-storage' : mounted.kind,
       entries,
+      size: mounted.size || 0,
       source: mounted.source,
     });
     return mounted;
@@ -663,7 +684,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
     }
   }
 
-  return { index: buildIndex(views), sources };
+  return { index: buildIndex(views, { images }), sources, views };
 }
 
 module.exports = { prepareGame, readRomfs, buildIndex };

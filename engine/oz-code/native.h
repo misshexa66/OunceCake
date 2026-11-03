@@ -24,6 +24,7 @@ typedef struct {
     u32 (*close_handle)(u32);
     int (*thread_create)(u64 *, void *, void *(*)(void *), void *);
     int (*thread_join)(u64, void **);
+    int (*setsockopt)(int, int, int, const void *, u32); // optional, 0 if the sdk doesn't export it
 } FtpFunctions;
 // kinds: 0 = base/update romfs, 1 = exefs, 2 = dlc romfs
 typedef struct {u32 handle; u8 kind, attributes; u16 reserved; u64 size;} Source;

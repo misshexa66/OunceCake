@@ -27,6 +27,16 @@ git clone https://github.com/misshexa66/OunceCake.git
 
 5. When OunceCake says `FTP up! ftp://<switch 2 ip>:2121`, use an FTP client to connect to your Switch 2's local IP address with port 2121. A username and password is not required. (Make sure your FTP client has its transfer mode set to Binary/Image/TYPE I.)
 
+### Dumping straight to a .nup
+
+Instead of browsing the FTP yourself, OunceCake can download everything (base, updates and DLC) and pack it into a single `.nup` file:
+
+```
+node ouncecake.cjs <path-to-ns2jb-run> --nup game.nup --ip <switch 2 ip>
+```
+
+Each RomFS is pulled as one big image instead of thousands of small files, so this runs at roughly full network speed. Files are hashed, deduplicated across base/updates and zstd compressed on the PC as they come in. Needs Node 22.15 or newer (for zstd).
+
 ## Licensing
 
 OunceCake is licensed under the terms of the GPLv2 (because it borrows a tiny bit of code from [Atmosphere](https://github.com/Atmosphere-NX/Atmosphere))
