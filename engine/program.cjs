@@ -201,6 +201,16 @@ async function prepareInstalledLicense({ s, root, domain, service, title, source
 
   if (result.result) throw resultError('ES prepare installed title license', result.result);
 
+  //patch for nso, actually activate the title
+  const context = s.installedLicenseContext?.handle;
+
+  if (context && s.handles.has(context)) {
+    success(
+      await s.ipc('Activate prepared title keys', context, 102),
+      'Activate prepared title keys',
+    );
+  }
+
   return true;
 }
 
