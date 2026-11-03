@@ -5,6 +5,7 @@
 Tool to dump unencrypted romFS and exeFS for Switch 2 games, updates and DLC.
 
 Supports digital games, game cards, Switch 2 Editions, etc.
+(For NSO titles, make sure the title has been opened recently before you attempt to mount it, otherwise the mount will fail.)
 
 ## Disclaimer
 
