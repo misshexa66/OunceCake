@@ -7,7 +7,7 @@ const { discoverGames } = require('./engine/content.cjs');
 const { prepareGame } = require('./engine/mounts.cjs');
 const { deployFtp, readImage } = require('./engine/ftp.cjs');
 
-const USAGE = 'Usage: node poundcake.cjs <run-directory> [title-id] [--port 2121]\n' +
+const USAGE = 'Usage: node ouncecake.cjs <run-directory> [title-id] [--port 2121]\n' +
               'Use the run dir given by ns2jb (Run folder: <whatever>)\n' +
               'You can also provide a title ID to skip the selection menu and just mount a specific game\n';
 
