@@ -530,7 +530,7 @@ function buildIndex(views, { tar = false } = {}) {
   return bytes;
 }
 
-async function prepareGame({ attachment: a, title, shouldStop = () => false, tar = false }) {
+async function prepareGame({ attachment: a, title, latestOnly = false, contentOnly = false, tar = false, shouldStop = () => false }) {
   const views = [];
   const sources = [];
   const absentSources = [];
@@ -581,8 +581,10 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
     return entries;
   }
 
-  async function mountView(prefix, section, candidates, allowAbsent = false) {
-    if (prefix.includes("update")) {
+  async function mountView(prefix, section, candidates, allowAbsent = false, hidden = false) {
+    if (hidden) {
+      console.log('Resolving ' + prefix + '/' + section + ' (hidden, --latest-only)');
+    } else if (prefix.includes("update")) {
       console.log('Opening ' + prefix + '/' + section, ' (This takes a LOT of time! Don\'t assume we crashed!)');
     } else {
       console.log('Opening ' + prefix + '/' + section);
@@ -610,6 +612,12 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
       throw new Error(
         'Could not prepare ' + prefix + '/' + section + ': ' + (lastError?.message || 'No installed content'),
       );
+
+    // hidden mounts only exist so updates can find their original content; they never reach the FTP index
+    if (hidden) {
+      await files.close(mounted);
+      return mounted;
+    }
 
     const entries =
       mounted.kind === 'storage'
@@ -661,13 +669,17 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
     return grouped.values();
   }
 
-  async function mountPackage(prefix, candidates) {
+  async function mountPackage(prefix, candidates, hidden = false) {
     const contents = new Map();
     for (const candidate of candidates) {
       const record = candidate.dataPatch || candidate.dlc || candidate.update || candidate.base;
       for (const content of record.contents) {
         // skip deltafragment, it isn't an fs
         if (content.contentType === 6) continue;
+        // a hidden package only needs its programs registered as update originals
+        if (hidden && content.contentType !== 1) continue;
+        // --content-only: just programs and data, no meta/control/manual/legal
+        if (contentOnly && content.contentType !== 1 && content.contentType !== 2) continue;
         const key = content.programIndex + ':' + content.contentType;
         if (!contents.has(key)) contents.set(key, []);
         contents.get(key).push({ ...candidate, content });
@@ -684,10 +696,11 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
       }
       const sections = [
         ['meta'], ['romfs', 'exefs', 'logo'], ['romfs'], ['control'], ['manual'], ['legal'],
-      ][contentType];
+      ][contentType].filter(section => (!hidden || section === 'romfs') &&
+        (!contentOnly || section === 'romfs' || section === 'exefs'));
       for (const section of sections) {
         const mounted = await mountView(path, section, choices,
-          contentType === 1 && (section === 'romfs' || section === 'logo'));
+          contentType === 1 && (section === 'romfs' || section === 'logo'), hidden);
         choices = choices.filter(candidate => candidate.storage === mounted.source.storage);
       }
     }
@@ -697,15 +710,32 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
 
   const bases = await discoverBase({ ...a, title });
   cancelled();
-  const updates = await discoverUpdates({ ...a, title });
+  let updates = await discoverUpdates({ ...a, title });
   cancelled();
 
   const dlc = await discoverDlc({ ...a, title });
   cancelled();
-  const dataPatches = await discoverDataPatches({ ...a, title });
+  let dataPatches = await discoverDataPatches({ ...a, title });
+
+  if (latestOnly) {
+    // keep only the newest update, and the newest patch for each DLC
+    const newest = records => {
+      const max = new Map();
+      for (const r of records) max.set(r.contentTitle, Math.max(max.get(r.contentTitle) ?? -1, r.version));
+      return records.filter(r => r.version === max.get(r.contentTitle));
+    };
+    updates = newest(updates);
+    dataPatches = newest(dataPatches);
+  }
+  const patchedDlc = item => dataPatches.some(patch => patch.dataTitle === item.contentTitle &&
+    (!item.dataPatchTitle || item.dataPatchTitle === patch.contentTitle));
+
   const [baseGroup] = groups(bases);
   if (!baseGroup) throw new Error('No installed base content was found');
-  await mountPackage('/base', baseGroup.map(base => ({ storage: base.storage, base })));
+  // updates are dumped merged with the base, so with an update present the base is a duplicate.
+  // it still gets resolved (hidden) because the update needs it as its original.
+  await mountPackage('/base', baseGroup.map(base => ({ storage: base.storage, base })),
+    latestOnly && updates.length > 0);
 
   for (const group of groups(updates)) {
     await mountPackage('/updates/' + group[0].version,
@@ -714,6 +744,8 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
 
   for (const group of groups(dlc)) {
     const first = group[0];
+    // the patched DLC is dumped merged, so the unpatched copy is a duplicate
+    if (latestOnly && patchedDlc(first)) continue;
     const prefix = '/dlc/' + first.contentTitle + '/' + first.version + '/base';
     await mountPackage(prefix, group.map(dlc => ({ storage: dlc.storage, dlc })));
   }
