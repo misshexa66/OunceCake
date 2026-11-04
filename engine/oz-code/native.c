@@ -22,6 +22,8 @@ typedef struct {
     const Node *nodes;
     const char *strings;
     u64 count, string_bytes;
+    const TarMember *members;
+    u64 member_count;
     u32 cache_source;
     u64 cache_offset, cache_bytes;
 } Server;
@@ -102,17 +104,57 @@ static int string_valid(Server *s,u32 at,u64 limit) {
     for(u64 i=0;i<=limit&&at+i<s->string_bytes;i++) {if(!s->strings[at+i])return 1;}
     return 0;
 }
+static u64 tar_padded(u64 bytes) {return (bytes+511)&~511ULL;}
+static u64 tar_header_bytes(const TarMember *m) {
+    return 512+(m->pax_bytes?512+tar_padded(m->pax_bytes):0);
+}
+static int archive_valid(Server *s,const Node *n,u64 *cursor) {
+    const Source *source=s->c->sources+n->mount;
+    u32 first=(u32)n->offset,count=(u32)(n->offset>>32);
+    if(first!=*cursor||!count||first>s->member_count||count>s->member_count-first)return 0;
+    if(!string_valid(s,n->source_path,source->kind>=2?0x300:0))return 0;
+    if(source->kind>=2&&s->strings[n->source_path]!='@')return 0;
+    u64 position=0;
+    for(u64 i=first;i<(u64)first+count;i++) {
+        const TarMember *m=s->members+i;
+        if(m->start!=position||!m->name_length||m->name_length>100||m->prefix_length>155||
+            !string_valid(s,m->name_offset,m->name_length)||length(s->strings+m->name_offset)!=m->name_length||
+            !string_valid(s,m->prefix_offset,m->prefix_length)||length(s->strings+m->prefix_offset)!=m->prefix_length||
+            m->directory>1||(m->directory&&m->size)||m->pax_bytes>4096||
+            !string_valid(s,m->pax_offset,m->pax_bytes)||length(s->strings+m->pax_offset)!=m->pax_bytes||
+            (m->size>0x1ffffffffULL&&!m->pax_bytes)||m->size>~0ULL-511)return 0;
+        u64 header=tar_header_bytes(m),data=tar_padded(m->size);
+        if(position>~0ULL-header||data>~0ULL-position-header)return 0;
+        position+=header+data;if(m->end!=position)return 0;
+        if(!m->directory) {
+            if(source->kind==0||source->kind==2) {
+                if(m->offset>source->size||m->size>source->size-m->offset)return 0;
+            } else if(!string_valid(s,m->source_path,0x300)||s->strings[m->source_path]!='/')return 0;
+        }
+    }
+    *cursor+=(u64)count;
+    return position<=~0ULL-1024&&n->size==position+1024;
+}
 static int index_valid(Server *s) {
     FtpConfig *c=s->c;
     if(!c->index||c->index_bytes<64||c->source_count>0xffffffffULL||!c->sources||!c->source_count)return 0;
     const u64 *header=(const u64 *)c->index;
-    if(header[0]!=INDEX_MAGIC||((const u32 *)header)[2]!=1||((const u32 *)header)[3]!=48||
-        !header[2]||header[2]>=NONE||header[3]!=64||header[4]!=64+header[2]*48||header[6]!=c->index_bytes||
+    u32 version=((const u32 *)header)[2];u64 head=version==2?96:64;
+    if(header[0]!=INDEX_MAGIC||(version!=1&&version!=2)||c->index_bytes<head||((const u32 *)header)[3]!=48||
+        !header[2]||header[2]>=NONE||header[3]!=head||header[6]!=c->index_bytes||
         header[4]>c->index_bytes||header[5]!=c->index_bytes-header[4])return 0;
-    s->nodes=(const Node *)(c->index+64);s->count=header[2];s->strings=(const char *)c->index+header[4];s->string_bytes=header[5];
+    u64 nodes_end=head+header[2]*48;
+    s->members=0;s->member_count=0;
+    if(version==2) {
+        if(header[7]!=nodes_end||header[8]>=NONE||header[9]!=64||header[10]||header[11]||
+            header[4]!=nodes_end+header[8]*64)return 0;
+        s->members=(const TarMember *)(c->index+nodes_end);s->member_count=header[8];
+    } else if(header[4]!=nodes_end)return 0;
+    s->nodes=(const Node *)(c->index+head);s->count=header[2];s->strings=(const char *)c->index+header[4];s->string_bytes=header[5];
+    u64 member_cursor=0;
     for(u32 i=0;i<s->count;i++) {
         const Node *n=s->nodes+i;
-        if(n->type>1||(!i&&(n->type||n->parent||n->name_length))||(i&&n->parent>=i)||
+        if(n->type>(version==2?NODE_TAR:1u)||(!i&&(n->type||n->parent||n->name_length))||(i&&n->parent>=i)||
             n->name_length>=PATH_BYTES||!string_valid(s,n->name_offset,n->name_length)||
             length(s->strings+n->name_offset)!=n->name_length)return 0;
         const char *name=s->strings+n->name_offset;
@@ -127,6 +169,10 @@ static int index_valid(Server *s) {
             const Source *source=c->sources+n->mount;
             if(!source->handle||source->kind>3||source->reserved||source->attributes>15||source->proxy_type>6||
                 (source->kind<2&&(source->attributes||source->proxy_type)))return 0;
+            if(n->type==NODE_TAR) {
+                if(!archive_valid(s,n,&member_cursor))return 0;
+                continue;
+            }
             if(source->kind==0||source->kind==2) {
                 if(n->offset+n->size<n->offset||n->offset+n->size>source->size)return 0;
             }
@@ -136,7 +182,7 @@ static int index_valid(Server *s) {
                 s->strings[n->offset]!='@'))return 0;
         }
     }
-    return 1;
+    return member_cursor==s->member_count;
 }
 static u32 lookup(Client *p,const char *name) {
     Server *s=p->server;u32 current=*name=='/'?0:p->cwd;
@@ -299,6 +345,7 @@ static int read_source(Server *s,const Node *n,u64 offset,u32 count) {
     if(source->kind&&handle&&c->functions->close_handle(handle))ok=0;
     io_leave(c);return ok;
 }
+#include "tar.h"
 static int retrieve(Client *p,const char *name) {
     if(!p->binary) {
         passive_close(p);p->restart=0;
@@ -311,8 +358,12 @@ static int retrieve(Client *p,const char *name) {
     if(p->passive<0)return reply(p,"425 Use PASV or EPSV first\r\n");
     if(!reply(p,"150 Opening binary data connection\r\n"))return 0;
     int fd=data_accept(p),ok=fd>=0;u64 offset=restart;
+    if(n->type==NODE_TAR) {
+        if(ok)ok=tar_transfer(s,n,fd,restart);
+        if(ok)offset=n->size;
+    }
     if(source->kind==1||source->kind==3)s->cache_source=NONE;
-    while(ok&&offset<n->size&&!c->stop) {
+    while(n->type!=NODE_TAR&&ok&&offset<n->size&&!c->stop) {
         u64 count,inside=0;
         if(source->kind==1||source->kind==3) {
             count=n->size-offset;if(count>c->data_bytes)count=c->data_bytes;
@@ -428,7 +479,9 @@ void *ftp_main(void *configuration) {
     Server s;memset(&s,0,sizeof(s));s.c=c;s.cache_source=NONE;c->state=0;c->result=BAD;
     if(!c->functions||!c->ipc_buffer||!c->data||c->data_bytes<4096||c->data_bytes>0x400000||
         !c->port||c->port>65535||!c->slots||!c->reserved||c->reserved>FTP_MAX_CLIENTS||
-        c->slot_bytes<4096+c->data_bytes+8192||!index_valid(&s)) {c->state=3;return (void *)(u64)BAD;}
+        (c->output_bytes&&c->output_bytes!=TAR_OUTPUT_BYTES)||
+        c->slot_bytes<4096+c->data_bytes+8192+c->output_bytes||!index_valid(&s)||
+        (s.member_count&&c->output_bytes!=TAR_OUTPUT_BYTES)) {c->state=3;return (void *)(u64)BAD;}
     for(u32 i=0;i<c->reserved;i++)memset(c->slots+i*c->slot_bytes,0,sizeof(ClientSlot));
     FtpFunctions *f=c->functions;int fd=f->socket(2,1,0);
     if(fd<0) {c->state=3;return (void *)(u64)BAD;}

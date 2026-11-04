@@ -28,6 +28,10 @@ git clone https://github.com/misshexa66/OunceCake.git
 
 5. When OunceCake says `FTP up! ftp://<switch 2 ip>:2121`, use an FTP client to connect to your Switch 2's local IP address with port 2121. A username and password is not required. (Make sure your FTP client has its transfer mode set to Binary/Image/TYPE I.)
 
+## Tar Mode
+
+OunceCake now has support for showing game data as .tar files instead of raw folders, allowing for faster downloading. Add `--tar` to the launch args.
+
 ## Licensing
 
 OunceCake is licensed under the terms of the GPLv2 (because it borrows a tiny bit of code from [Atmosphere](https://github.com/Atmosphere-NX/Atmosphere))

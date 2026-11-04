@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const http = require('node:http');
 const { resultError, cleanup } = require('./protocol.cjs');
+const { OUTPUT_BYTES } = require('./tar.cjs');
 
 const threadCode = {
   "create": {
@@ -156,6 +157,7 @@ function encodeConfiguration({
   sources,
   data,
   dataBytes,
+  outputBytes,
   slots,
   slotBytes,
   port,
@@ -178,6 +180,7 @@ function encodeConfiguration({
   pointer(104, data);
   config.writeBigUInt64LE(BigInt(dataBytes), 112);
   pointer(120, base + 0x8000);
+  config.writeBigUInt64LE(BigInt(outputBytes), 128);
   pointer(232, slots);
   config.writeBigUInt64LE(BigInt(slotBytes), 240);
 
@@ -242,8 +245,9 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
   const sourceOffset = align(indexOffset + index.length);
   const dataOffset = align(sourceOffset + sources.length * 16);
   const dataBytes = 0x400000;
+  const outputBytes = index.readUInt32LE(8) === 2 ? OUTPUT_BYTES : 0;
   const slotsOffset = dataOffset + dataBytes;
-  const slotBytes = align(4096 + dataBytes + 8192);
+  const slotBytes = align(4096 + dataBytes + 8192 + outputBytes);
 
   const work = new a.Session('ftp-native-' + Date.now(), align(slotsOffset + MAX_CLIENTS * slotBytes));
   work.record = async () => {};
@@ -319,6 +323,7 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
       sources,
       data: work.base + dataOffset,
       dataBytes,
+      outputBytes,
       slots: work.base + slotsOffset,
       slotBytes,
       port,

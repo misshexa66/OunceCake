@@ -4,6 +4,7 @@ const { success, pathRequest, idBytes, resultError, cleanup, closeHandles, throw
 const { discoverBase, discoverUpdates, discoverDlc, discoverDataPatches, resolveContent } = require('./content.cjs');
 const { createProgramMounts, prepareInstalledLicense } = require('./program.cjs');
 const { openDlcPatch } = require('./dlc.cjs');
+const { planTar, MEMBER_BYTES } = require('./tar.cjs');
 
 // ncm mounts + metadata used for getting the ftp server ready
 
@@ -344,10 +345,11 @@ const checkIndex = (ok, why) => {
   if (!ok) throw new Error('Invalid FTP index: ' + why);
 };
 
-function buildIndex(views) {
+function buildIndex(views, { tar = false } = {}) {
   const nodes = [{ path: '/', name: '', parent: 0, type: 'directory', children: [] }];
   const byPath = new Map([['/', 0]]);
   const entries = new Set();
+  const members = [];
 
   function addDirectory(filename) {
     if (byPath.has(filename)) {
@@ -374,8 +376,8 @@ function buildIndex(views) {
   const stringsByValue = new Map();
   let stringBytes = 0;
 
-  function string(value) {
-    checkIndex(!/[\0\r\n]/.test(value), 'control character in a name');
+  function string(value, extended = false) {
+    checkIndex(!(extended ? /\0/ : /[\0\r\n]/).test(value), 'control character in a name');
 
     if (stringsByValue.has(value)) return stringsByValue.get(value);
 
@@ -393,6 +395,27 @@ function buildIndex(views) {
     if (view.kind === 'deferred-storage' || view.kind === 'deferred-filesystem') {
       checkIndex(view.source.contentPath.startsWith('@'), 'deferred content path');
       checkIndex(Buffer.byteLength(view.source.contentPath) <= 0x300, 'content path is too long');
+    }
+
+    if (tar) {
+      const archive = planTar(view);
+      const filename = prefix + '.tar';
+      checkIndex(Buffer.byteLength(filename) <= 1023 && !/[\0\r\n]/.test(filename), 'FTP archive path');
+      checkIndex(!byPath.has(filename), 'duplicate archive path');
+      const parent = addDirectory(path.posix.dirname(filename));
+      const id = nodes.length;
+      checkIndex(members.length + archive.members.length < NONE, 'too many archive members');
+      nodes.push({
+        path: filename, name: path.posix.basename(filename), parent, type: 'tar',
+        mount: view.mount,
+        offset: BigInt(members.length) | (BigInt(archive.members.length) << 32n),
+        size: archive.size,
+        sourcePath: view.kind.startsWith('deferred-') ? view.source.contentPath : '',
+      });
+      byPath.set(filename, id);
+      nodes[parent].children.push(id);
+      for (const member of archive.members) members.push(member);
+      continue;
     }
 
     addDirectory(prefix);
@@ -444,31 +467,45 @@ function buildIndex(views) {
     });
   }
 
-  const stringOffset = HEADER + nodes.length * STRIDE;
+  for (const member of members) {
+    member.nameOffset = string(member.name);
+    member.prefixOffset = string(member.prefix);
+    member.sourceOffset = string(member.sourcePath);
+    member.paxOffset = string(member.pax, true);
+  }
+
+  const headerBytes = tar ? 96 : HEADER;
+  const memberOffset = headerBytes + nodes.length * STRIDE;
+  const stringOffset = memberOffset + members.length * MEMBER_BYTES;
   const length = stringOffset + stringBytes;
   checkIndex(length <= 0xffffffff, 'index exceeds format precision');
 
   const bytes = Buffer.alloc(length);
   MAGIC.copy(bytes);
-  bytes.writeUInt32LE(1, 8);
+  bytes.writeUInt32LE(tar ? 2 : 1, 8);
   bytes.writeUInt32LE(STRIDE, 12);
 
   for (const [at, value] of [
     [16, nodes.length],
-    [24, HEADER],
+    [24, headerBytes],
     [32, stringOffset],
     [40, stringBytes],
     [48, length],
   ]) {
     bytes.writeBigUInt64LE(BigInt(value), at);
   }
+  if (tar) {
+    bytes.writeBigUInt64LE(BigInt(memberOffset), 56);
+    bytes.writeBigUInt64LE(BigInt(members.length), 64);
+    bytes.writeBigUInt64LE(BigInt(MEMBER_BYTES), 72);
+  }
 
   nodes.forEach((node, id) => {
-    const at = HEADER + id * STRIDE;
+    const at = headerBytes + id * STRIDE;
     bytes.writeUInt32LE(node.parent, at);
     bytes.writeUInt32LE(node.children?.[0] ?? NONE, at + 4);
     bytes.writeUInt32LE(node.next ?? NONE, at + 8);
-    bytes.writeUInt32LE(node.type === 'file' ? 1 : 0, at + 12);
+    bytes.writeUInt32LE(node.type === 'tar' ? 2 : node.type === 'file' ? 1 : 0, at + 12);
     bytes.writeUInt32LE(node.nameOffset, at + 16);
     bytes.writeUInt32LE(Buffer.byteLength(node.name), at + 20);
     bytes.writeUInt32LE(node.mount || 0, at + 24);
@@ -476,11 +513,24 @@ function buildIndex(views) {
     bytes.writeBigUInt64LE(BigInt(node.offset || 0), at + 32);
     bytes.writeBigUInt64LE(BigInt(node.size || 0), at + 40);
   });
+  members.forEach((member, i) => {
+    const at = memberOffset + i * MEMBER_BYTES;
+    bytes.writeBigUInt64LE(member.start, at);
+    bytes.writeBigUInt64LE(member.size, at + 8);
+    bytes.writeBigUInt64LE(member.offset, at + 16);
+    for (const [offset, value] of [
+      [24, member.nameOffset], [28, Buffer.byteLength(member.name)],
+      [32, member.prefixOffset], [36, Buffer.byteLength(member.prefix)],
+      [40, member.sourceOffset], [44, member.paxOffset],
+      [48, member.paxBytes], [52, member.directory ? 1 : 0],
+    ]) bytes.writeUInt32LE(value, at + offset);
+    bytes.writeBigUInt64LE(member.end, at + 56);
+  });
   Buffer.concat(strings, stringBytes).copy(bytes, stringOffset);
   return bytes;
 }
 
-async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
+async function prepareGame({ attachment: a, title, shouldStop = () => false, tar = false }) {
   const views = [];
   const sources = [];
   const absentSources = [];
@@ -734,7 +784,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
     }
   }
 
-  return { index: buildIndex(views), sources };
+  return { index: buildIndex(views, { tar }), sources };
 }
 
 module.exports = { prepareGame, readRomfs, buildIndex };
