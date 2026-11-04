@@ -375,8 +375,7 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
 }
 
 // special handling for manuals. they mount weird.
-async function withManualPaths({ attachment: a, title, source, originalSource, operation }) {
-  const programId = source.runtimeProgramId;
+async function withManualPaths({ attachment: a, title, source, originalSource, programId, operation }) {
   const resolvers = [];
   return withCleanup(async () => {
     const lr = await a.service('lr');
@@ -503,12 +502,15 @@ function createProgramMounts(attachment) {
         operation: () => openCode({ title: programSource.runtimeProgramId, storage: programSource.storage,
           attributes: programSource.attributes, source: programSource }) }));
     const policy = await readPolicy(code);
+    // manuals use this magic value for "unspecified"
+    const programId = source.runtimeProgramId === originalSource.runtimeProgramId
+      ? source.runtimeProgramId : 'ffffffffffffffff';
     let handle;
     try {
       return await withUpdateLicenses({ attachment, title, source, originalSource,
-        operation: () => withManualPaths({ attachment, title, source, originalSource,
+        operation: () => withManualPaths({ attachment, title, source, originalSource, programId,
           operation: async () => {
-            handle = await openProgramManual({ attachment, title: source.runtimeProgramId,
+            handle = await openProgramManual({ attachment, title: programId,
               storage: originalSource.storage, policy });
             return handle;
           } }) });
