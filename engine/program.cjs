@@ -1,8 +1,8 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { idBytes, fixedOutput, pathRequest, resultError, success, withCleanup, closeHandles } = require('./protocol.cjs');
+const { idBytes, fixedOutput, pathRequest, resultError, success, withCleanup, cleanup, closeHandles } = require('./protocol.cjs');
 const { findOriginalContent, isInstalledUpdate, programMatchesApplication } = require('./content.cjs');
-const { withProgramIndexMap, openProgramRomfs } = require('./fs-context.cjs');
+const { withProgramIndexMap, openProgramRomfs, openProgramManual } = require('./fs-context.cjs');
 
 // if license on most recent account doesn't work, try other ones on the system
 async function linkedAccounts(s, domain, service) {
@@ -264,7 +264,7 @@ async function withUpdateLicenses({ attachment, title, source, originalSource, o
 
 
 // pick the right archives for mounting
-async function readLocation(a, resolver, programId) {
+async function readLocation(a, resolver, programId, command = 0) {
   const address = a.s.base + 0x3800;
   const size = 0x300;
 
@@ -272,11 +272,11 @@ async function readLocation(a, resolver, programId) {
     a.s,
     'Resolve selected update location',
     resolver,
-    fixedOutput(0, idBytes(programId), address, size),
+    fixedOutput(command, idBytes(programId), address, size),
   );
 
-  // either of these mean no program, return null
-  if ([0x408, 0x1408].includes(r.result & 0x3fffff)) return null;
+  const absent = command === 0 ? [0x408, 0x1408] : [0xc08];
+  if (absent.includes(r.result & 0x3fffff)) return null;
 
   if (r.result) throw resultError('Resolve selected update location', r.result);
 
@@ -286,6 +286,24 @@ async function readLocation(a, resolver, programId) {
     contentPath: new TextDecoder('utf-8', { fatal: true }).decode(b.subarray(0, end)),
     attributes: r.data.subarray(0, 16).toString('hex'),
   };
+}
+
+function contentLocation(source) {
+  const attributes = Buffer.alloc(16);
+  attributes[0] = source.attributes;
+  return { contentPath: source.contentPath, attributes: attributes.toString('hex') };
+}
+
+async function writeLocation(a, resolver, programId, title, location, command = 1, label = 'Select content location') {
+  const input = Buffer.alloc(32);
+  idBytes(programId).copy(input);
+  idBytes(title).copy(input, 8);
+  Buffer.from(location.attributes, 'hex').copy(input, 16);
+  const filename = Buffer.alloc(0x300);
+  filename.write(location.contentPath);
+  await a.s.write(a.s.base + 0x4000, filename);
+  success(await a.domain.send(a.s, label, resolver,
+    pathRequest(command, input, a.s.base + 0x4000, 0x300)), label);
 }
 
 async function selectPatch({ attachment: a, title, source, originalSource, operation }) {
@@ -316,9 +334,7 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
       original = { ...await readLocation(a, resolvers.get(originalSource.storage), title), storage: originalSource.storage };
       patch = { ...await readLocation(a, resolvers.get(source.storage), source.contentTitle), storage: source.storage };
     } else {
-      const attributes = Buffer.alloc(16);
-      attributes[0] = source.attributes;
-      patch = { ...source, attributes: attributes.toString('hex') };
+      patch = { ...source, ...contentLocation(source) };
     }
 
     const opened = await a.s.ipc('Open registered patch resolver', lr, 1);
@@ -328,16 +344,8 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
     registered = a.domain.oneHandle(opened);
     previous = await readLocation(a, registered, runtimeProgramId);
     
-    const input = Buffer.alloc(32);
-    idBytes(runtimeProgramId).copy(input);
-    idBytes(title).copy(input, 8);
-    Buffer.from(patch.attributes, 'hex').copy(input, 16);
-    const filename = Buffer.alloc(0x300);
-    filename.write(patch.contentPath);
-    await a.s.write(a.s.base + 0x4000, filename);
     attempted = true;
-    success(await a.domain.send(a.s, 'Register owned patch location', registered,
-      pathRequest(1, input, a.s.base + 0x4000, 0x300)), 'Register owned patch location');
+    await writeLocation(a, registered, runtimeProgramId, title, patch, 1, 'Register owned patch location');
 
     const mount = () =>
       operation({ runtimeProgramId, original, patch, originalContent: originalSource });
@@ -356,15 +364,7 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
   }, async () => {
     if (!attempted) return;
     if (previous) {
-      const filename = Buffer.alloc(0x300);
-      filename.write(previous.contentPath);
-      await a.s.write(a.s.base + 0x4000, filename);
-      const input = Buffer.alloc(32);
-      idBytes(runtimeProgramId).copy(input);
-      idBytes(title).copy(input, 8);
-      Buffer.from(previous.attributes, 'hex').copy(input, 16);
-      success(await a.domain.send(a.s, 'Restore previous program location', registered,
-        pathRequest(1, input, a.s.base + 0x4000, 0x300)), 'Restore previous program location');
+      await writeLocation(a, registered, runtimeProgramId, title, previous, 1, 'Restore previous program location');
       return;
     }
     const actual = await readLocation(a, registered, runtimeProgramId);
@@ -372,6 +372,42 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
     success(await a.s.ipc('Remove owned patch location', registered, 2, idBytes(runtimeProgramId)),
       'Remove owned patch location');
   }, () => closeHandles(a.s, [...resolvers.values(), registered].filter(Boolean)));
+}
+
+// special handling for manuals. they mount weird.
+async function withManualPaths({ attachment: a, title, source, originalSource, operation }) {
+  const programId = source.runtimeProgramId;
+  const resolvers = [];
+  return withCleanup(async () => {
+    const lr = await a.service('lr');
+    // grab original manual, then grab updated manual
+    for (const spec of [
+      { command: 0, input: Buffer.from([originalSource.storage]), read: 3, write: 6, erase: 14, source: originalSource },
+      { command: 1, input: Buffer.alloc(0), read: 4, write: 5, erase: 6, source },
+    ]) {
+      const handle = a.domain.oneHandle(success(await a.s.ipc('Open game manual resolver', lr,
+        spec.command, spec.input), 'Open game manual resolver'));
+      const resolver = { ...spec, handle };
+      resolvers.push(resolver);
+      resolver.previous = await readLocation(a, handle, programId, spec.read);
+      const selected = contentLocation(spec.source);
+      if (resolver.previous?.contentPath === selected.contentPath &&
+          resolver.previous.attributes === selected.attributes) continue;
+      resolver.changed = true;
+      await writeLocation(a, handle, programId, title, selected, spec.write);
+    }
+    return operation();
+  }, () => cleanup([...resolvers].reverse().map(resolver => async () => {
+    if (!resolver.changed) return;
+    success(await a.s.ipc('Remove temporary game manual location', resolver.handle,
+      resolver.erase, idBytes(programId)), 'Remove temporary game manual location');
+    if (!resolver.previous) return;
+    const restored = await readLocation(a, resolver.handle, programId, resolver.read);
+    if (restored?.contentPath !== resolver.previous.contentPath ||
+        restored.attributes !== resolver.previous.attributes) {
+      await writeLocation(a, resolver.handle, programId, title, resolver.previous, resolver.write);
+    }
+  })), () => closeHandles(a.s, resolvers.map(resolver => resolver.handle)));
 }
 
 function createProgramMounts(attachment) {
@@ -424,6 +460,14 @@ function createProgramMounts(attachment) {
     }),
   }) : openCodeRaw(args);
 
+  const readPolicy = code => withCleanup(async () => {
+    const file = success(await filesystem.openFile(s, code, '/main.npdm'), 'Open program policy');
+    return withCleanup(async () => {
+      const size = Number(await filesystem.fileSize(s, file.handle));
+      return filesystem.readFile(s, file.handle, 0, size);
+    }, () => s.close(file.handle));
+  }, () => s.close(code));
+
   const openUpdate = (args) => selectPatch({
     attachment,
     title: args.title,
@@ -443,22 +487,36 @@ function createProgramMounts(attachment) {
         };
         if (args.section === 'exefs') return openCodeRaw(mountArgs);
 
-        const code = await openCodeRaw(mountArgs);
-        const policy = await withCleanup(async () => {
-          const opened = await filesystem.openFile(s, code, '/main.npdm');
-          success(opened, 'Mounted program policy');
-          return withCleanup(async () => {
-            const size = Number(await filesystem.fileSize(s, opened.handle));
-            return filesystem.readFile(s, opened.handle, 0, size);
-          }, () => s.close(opened.handle));
-        }, () => s.close(code));
+        const policy = await readPolicy(await openCodeRaw(mountArgs));
         return openProgramRomfs({
           attachment, title: selection.runtimeProgramId, storage: selection.original.storage, policy,
         });
       },
     }),
   });
-  return { openCode, openUpdate };
+
+  const openManualPatch = async ({ title, source, originalSource, programSource, originalProgramSource }) => {
+    const code = await (programSource.selection === 'update'
+      ? openUpdate({ title, storage: programSource.storage, source: programSource,
+        originalSource: originalProgramSource, section: 'exefs' })
+      : withUpdateLicenses({ attachment, title, source: programSource,
+        operation: () => openCode({ title: programSource.runtimeProgramId, storage: programSource.storage,
+          attributes: programSource.attributes, source: programSource }) }));
+    const policy = await readPolicy(code);
+    let handle;
+    try {
+      return await withUpdateLicenses({ attachment, title, source, originalSource,
+        operation: () => withManualPaths({ attachment, title, source, originalSource,
+          operation: async () => {
+            handle = await openProgramManual({ attachment, title: source.runtimeProgramId,
+              storage: originalSource.storage, policy });
+            return handle;
+          } }) });
+    } catch (error) {
+      await cleanup([() => handle && s.close(handle)], error);
+    }
+  };
+  return { openCode, openUpdate, openManualPatch };
 }
 
 module.exports = { createProgramMounts, prepareInstalledLicense, withUpdateLicenses };

@@ -156,8 +156,8 @@ async function registryReader(a) {
   return { memory, layout };
 }
 
-// your romfs. hand it over.
-async function openProgramRomfs({ attachment: a, title, storage, policy }) {
+// your program content. hand it over.
+async function openProgramContent({ attachment: a, title, storage, policy, manual = false }) {
   const controls = accessControls(policy, title);
   const reader = await registryReader(a);
   // random ID for telling the system "look this very real process that's totally the game wants data"
@@ -181,6 +181,14 @@ async function openProgramRomfs({ attachment: a, title, storage, policy }) {
       ],
     }), 'Register owned temporary program context');
     registered = true;
+    // special handling for game manuals
+    if (manual) {
+      const input = Buffer.alloc(16);
+      input.writeUInt32LE(4);
+      idBytes(title).copy(input, 8);
+      return a.domain.oneHandle(success(await a.s.ipc('Open composed game manual', a.root, 7, input),
+        'Open composed game manual'));
+    }
     return openCurrentProgramRomfs({ attachment: a, reader, owner });
   }, async () => {
     if (!registered) return;
@@ -349,4 +357,7 @@ async function withProgramIndexMap({ attachment: a, title, runtimeProgramId, pro
   });
 }
 
-module.exports = { openProgramRomfs, withProgramIndexMap };
+const openProgramRomfs = options => openProgramContent(options);
+const openProgramManual = options => openProgramContent({ ...options, manual: true });
+
+module.exports = { openProgramRomfs, openProgramManual, withProgramIndexMap };

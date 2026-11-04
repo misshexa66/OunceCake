@@ -13,8 +13,9 @@ const safeSize = (n) => { // lol, ai put this in. in what situation would this e
 };
 
 function createGameFiles(attachment) {
-  const { openCode, openUpdate } = createProgramMounts(attachment);
+  const { openCode, openUpdate, openManualPatch } = createProgramMounts(attachment);
   const originals = new Map();
+  const originalManuals = new Map();
   const { s, root, domain, filesystem, service } = attachment;
 
   const send = async (label, handle, bytes) => success(await domain.send(s, label, handle, bytes), label);
@@ -43,10 +44,23 @@ function createGameFiles(attachment) {
       filename.write(contentPath);
 
       let handle;
+      let composed = false;
 
       const filesystemType = { meta: 5, logo: 2, control: 3, manual: 4, legal: 4 }[section];
 
-      if (filesystemType !== undefined) {
+      if (update && section === 'manual' && originalManuals.has(source.programIndex)) {
+        source.originalSource = originalManuals.get(source.programIndex);
+        const originalProgramSource = originals.get(source.programIndex) || originals.get(0);
+        const programContent = update.contents.find(item => item.contentType === 1 &&
+          item.programIndex === source.programIndex);
+        const programSource = programContent
+          ? await resolveContent({ s, root, domain, service, title, storage, update, content: programContent })
+          : originalProgramSource;
+        if (!programSource) throw new Error('No game program found for manual index ' + source.programIndex);
+        handle = await openManualPatch({ title, source, originalSource: source.originalSource,
+          programSource, originalProgramSource });
+        composed = true;
+      } else if (filesystemType !== undefined) {
         source.proxyType = filesystemType;
         const input = Buffer.alloc(16);
         input[0] = attributes;
@@ -95,6 +109,7 @@ function createGameFiles(attachment) {
         kind: section === 'romfs' ? 'storage' : 'filesystem',
         source,
         title,
+        composed,
       };
 
       if (mounted.kind === 'storage') {
@@ -103,6 +118,7 @@ function createGameFiles(attachment) {
       }
 
       if (base && source.contentType === 1) originals.set(source.programIndex, source);
+      if (base && source.contentType === 4) originalManuals.set(source.programIndex, source);
       return mounted;
     } catch (error) {
       if (source) error.source = source;
@@ -553,8 +569,8 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
           }, mounted.size)
         : await filesystemEntries(mounted);
     const mount = sources.length;
-    // only composed storages and CodeFS need to stay mounted between downloads
-    const deferredFilesystem = mounted.kind === 'filesystem' && section !== 'exefs';
+    // composed stuff (i.e game updates mounted on base games) and codefs need to stay mounted
+    const deferredFilesystem = mounted.kind === 'filesystem' && section !== 'exefs' && !mounted.composed;
     const deferredStorage = mounted.kind === 'storage' &&
       mounted.source.selection !== 'datapatch' &&
       !(mounted.source.selection === 'update' && mounted.source.contentType === 1);
