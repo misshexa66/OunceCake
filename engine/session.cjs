@@ -128,7 +128,8 @@ async function attachGame(run) {
       services.set(name, handle);
       return handle;
     }
-    return { s, root, domain, filesystem, service, run, live, Session, current, proof, close: () => s.cleanup() };
+    return { s, root, domain, filesystem, service, run, live, Session, current, proof,
+      close: async () => { if (!s.threads.size) await s.cleanup(); } };
   } catch (error) {
     await cleanup([() => s.cleanup()], error);
   }

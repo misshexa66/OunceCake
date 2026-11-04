@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const http = require('node:http');
 const { resultError, cleanup } = require('./protocol.cjs');
 
 const threadCode = {
@@ -185,12 +186,53 @@ function encodeConfiguration({
     table.writeUInt32LE(source.handle, i * 16);
     table.writeUInt32LE(source.kind, i * 16 + 4);
 
-    if (source.kind === 2) table[i * 16 + 5] = source.attributes;
+    if (source.kind === 2 || source.kind === 3) {
+      table[i * 16 + 5] = source.attributes;
+      table[i * 16 + 6] = source.proxyType;
+    }
 
-    table.writeBigUInt64LE(BigInt(source.size), i * 16 + 8);
+    table.writeBigUInt64LE(source.kind === 3 ? BigInt('0x' + source.programId) : BigInt(source.size), i * 16 + 8);
   });
 
   return { config, sources: table };
+}
+
+async function stopFtpWorker({ run, base, worker, timeout = 10000 }) {
+  const { port } = JSON.parse(await fs.readFile(path.join(run, 'connection.json'), 'utf8'));
+  const deadline = Date.now() + timeout;
+  // shutdown must not inherit the RPC transport's three minute timeout
+  const request = body => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/', method: 'POST',
+      headers: { 'content-type': 'application/json' } }, res => {
+      const parts = [];
+      res.on('data', part => parts.push(part));
+      res.on('error', reject);
+      res.on('end', () => {
+        try {
+          const reply = JSON.parse(Buffer.concat(parts));
+          if (res.statusCode !== 200) throw new Error(reply.error || 'FTP shutdown RPC failed');
+          resolve(reply);
+        } catch (error) { reject(error); }
+      });
+    });
+    req.setTimeout(Math.max(1, Math.min(1000, deadline - Date.now())), () =>
+      req.destroy(new Error('FTP shutdown timed out (console probably crashed), reboot the switch 2 before retrying')));
+    req.on('error', reject);
+    req.end(JSON.stringify(body));
+  });
+
+  await request({ command: 'write', address: base + 0x400c, data: 'AQAAAA==' });
+  while (Date.now() < deadline) {
+    const reply = await request({ command: 'call', offset: threadCode.tryWait.offset,
+      args: [String(worker), '0', '0', '0'] });
+    if (BigInt(reply.result) === 1n) {
+      await request({ command: 'call', offset: threadCode.join.offset,
+        args: [String(worker), String(base + 0xa008), '0', '0'] });
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error('FTP worked didn\'t stop within' + timeout / 1000 + ' seconds (console probably crashed), reboot the switch 2 before retrying');
 }
 
 async function deployFtp({ attachment: a, image, index, sources, port }) {
@@ -235,19 +277,7 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
 
   async function close() {
     if (worker) {
-      await work.write(work.base + 0x400c, Buffer.from([1, 0, 0, 0]));
-
-      const until = Date.now() + 10000;
-      let stopped = false;
-      while (Date.now() < until) {
-        const result = await work.rpc.call3(a.live.sdk + threadCode.tryWait.offset, worker, 0, 0);
-
-        if (result === 1) { stopped = true; break; }
-
-        await new Promise((r) => setTimeout(r, 50));
-      }
-
-      const joined = await work.rpc.call3(a.live.sdk + threadCode.join.offset, worker, work.base + 0xa008, 0);
+      await stopFtpWorker({ run: a.run, base: work.base, worker });
       work.threads.delete(worker);
       a.s.threads.delete('standalone-ftp');
       worker = undefined;
@@ -357,4 +387,4 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
   }
 }
 
-module.exports = { deployFtp, readImage };
+module.exports = { deployFtp, readImage, stopFtpWorker };

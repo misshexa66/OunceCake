@@ -1,8 +1,9 @@
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
 const { success, pathRequest, idBytes, resultError, cleanup, closeHandles, throwIfCancelled } = require('./protocol.cjs');
-const { discoverUpdates, discoverDlc, resolveProgramContent, resolveDlcContent, programMatchesApplication } = require('./content.cjs');
+const { discoverBase, discoverUpdates, discoverDlc, discoverDataPatches, resolveContent } = require('./content.cjs');
 const { createProgramMounts, prepareInstalledLicense } = require('./program.cjs');
+const { openDlcPatch } = require('./dlc.cjs');
 
 // ncm mounts + metadata used for getting the ftp server ready
 
@@ -13,75 +14,85 @@ const safeSize = (n) => { // lol, ai put this in. in what situation would this e
 
 function createGameFiles(attachment) {
   const { openCode, openUpdate } = createProgramMounts(attachment);
-  let originalSource;
+  const originals = new Map();
   const { s, root, domain, filesystem, service } = attachment;
 
   const send = async (label, handle, bytes) => success(await domain.send(s, label, handle, bytes), label);
 
-  async function open({ title, storage, section = 'romfs', update, dlc }) {
+  async function open({ title, storage, section = 'romfs', base, update, dlc, dataPatch, content }) {
     let source;
     let mounted;
 
     try {
-      source = await (dlc ? resolveDlcContent : resolveProgramContent)({
+      source = await resolveContent({
         s,
+        root,
         domain,
         service,
         title,
         storage,
+        base,
         update,
         dlc,
+        dataPatch,
+        content,
       });
 
       const { contentPath, attributes } = source;
       const filename = Buffer.alloc(0x301);
       filename.write(contentPath);
 
-      if (update || dlc || section === 'exefs') {
-        await s.write(s.base + 0x2000, filename);
-
-        const identity = await send(
-          'Read selected NCA ProgramId',
-          root,
-          pathRequest(618, Buffer.from([attributes]), s.base + 0x2000),
-        );
-
-        const runtimeId = identity.data.readBigUInt64LE().toString(16).padStart(16, '0');
-
-        if (dlc) {
-        } else {
-          source.runtimeProgramId = runtimeId;
-        }
-      }
-
       let handle;
 
-      if (update) {
-        handle = await openUpdate({ title, storage, attributes, source, section, originalSource });
+      const filesystemType = { meta: 5, logo: 2, control: 3, manual: 4, legal: 4 }[section];
+
+      if (filesystemType !== undefined) {
+        source.proxyType = filesystemType;
+        const input = Buffer.alloc(16);
+        input[0] = attributes;
+        input.writeUInt32LE(filesystemType, 4);
+        idBytes(source.runtimeProgramId).copy(input, 8);
+        await s.write(s.base + 0x2000, filename);
+        handle = domain.oneHandle(await send('Open game ' + section, root,
+          pathRequest(10, input, s.base + 0x2000)));
+      } else if (dataPatch) {
+        const originalContent = dataPatch.original.contents.find(item =>
+          item.contentType === source.contentType && item.programIndex === source.programIndex);
+        if (!originalContent) throw new Error('No original DLC content found for index ' + source.programIndex);
+        source.originalSource = await resolveContent({
+          s, root, domain, service, title,
+          storage: dataPatch.original.storage,
+          dlc: dataPatch.original,
+          content: originalContent,
+        });
+        handle = source.contentType === 1
+          ? await openUpdate({ title, storage, attributes, source, section, originalSource: source.originalSource })
+          : await openDlcPatch({ attachment, title, source, originalSource: source.originalSource });
+      } else if (update && source.contentType === 1) {
+        source.originalSource = originals.get(source.programIndex) || originals.get(0);
+        handle = await openUpdate({
+          title, storage, attributes, source, section,
+          originalSource: source.originalSource,
+        });
       } else if (section === 'exefs') {
         handle = await openCode({ title: source.runtimeProgramId, storage, attributes, source });
       } else {
-        // use type 1 for base romfs, type 6 for dlc
+        // base program archive uses type 1, other nca files (data) use 6
         await s.write(s.base + 0x2000, filename);
 
         const input = Buffer.alloc(8);
         input[0] = attributes;
-        input.writeUInt32LE(dlc ? 6 : 1, 4);
+        source.proxyType = source.contentType === 2 ? 6 : 1;
+        input.writeUInt32LE(source.proxyType, 4);
 
-        try {
-          handle = domain.oneHandle(
-            await send('OpenDataStorageByPath', root, pathRequest(206, input, s.base + 0x2000)),
-          );
-        } catch (error) {
-          if (!dlc && error.nativeResult?.canonical === 0x7d202) error.code = 'GAME_ROMFS_ABSENT';
-
-          throw error;
-        }
+        handle = domain.oneHandle(
+          await send('OpenDataStorageByPath', root, pathRequest(206, input, s.base + 0x2000)),
+        );
       }
 
       mounted = {
         handle,
-        kind: section === 'exefs' ? 'filesystem' : 'storage',
+        kind: section === 'romfs' ? 'storage' : 'filesystem',
         source,
         title,
       };
@@ -91,7 +102,7 @@ function createGameFiles(attachment) {
         mounted.size = safeSize(reply.data.readBigUInt64LE());
       }
 
-      if (!update && !dlc) originalSource = source;
+      if (base && source.contentType === 1) originals.set(source.programIndex, source);
       return mounted;
     } catch (error) {
       if (source) error.source = source;
@@ -363,8 +374,9 @@ function buildIndex(views) {
   for (const view of views) {
     const prefix = view.path;
 
-    if (view.kind === 'deferred-storage') {
-      checkIndex(view.source.contentPath.startsWith('@'), 'deferred Data content path');
+    if (view.kind === 'deferred-storage' || view.kind === 'deferred-filesystem') {
+      checkIndex(view.source.contentPath.startsWith('@'), 'deferred content path');
+      checkIndex(Buffer.byteLength(view.source.contentPath) <= 0x300, 'content path is too long');
     }
 
     addDirectory(prefix);
@@ -374,7 +386,8 @@ function buildIndex(views) {
       checkIndex(!entries.has(filename), 'duplicate path');
       entries.add(filename);
 
-      if (view.kind === 'filesystem') checkIndex(Buffer.byteLength(item.path) <= 0x300, 'CodeFS path is too long');
+      if (view.kind === 'filesystem' || view.kind === 'deferred-filesystem')
+        checkIndex(Buffer.byteLength(item.path) <= 0x300, 'filesystem path is too long');
 
       checkIndex(Buffer.byteLength(filename) <= 1023 && !/[\r\n]/.test(filename), 'FTP path length or character');
 
@@ -393,10 +406,10 @@ function buildIndex(views) {
         parent,
         type: 'file',
         mount: view.mount,
-        offset: item.offset || 0,
+        offset: view.kind === 'deferred-filesystem' ? string(view.source.contentPath) : item.offset || 0,
         size: item.size,
         sourcePath:
-          view.kind === 'filesystem'
+          view.kind === 'filesystem' || view.kind === 'deferred-filesystem'
             ? item.path
             : view.kind === 'deferred-storage'
               ? view.source.contentPath
@@ -518,12 +531,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
       } catch (error) {
         if (!error.nativeResult || error.code === 'FTP_CANCELLED') throw error;
 
-        if (
-          allowAbsent &&
-          error.code === 'GAME_ROMFS_ABSENT' &&
-          error.source.metaType === 0x80 &&
-          !error.source.selection
-        ) {
+        if (allowAbsent && error.nativeResult.canonical === 0x7d202) {
           absentSources.push(error.source);
           return { source: error.source };
         }
@@ -545,21 +553,28 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
           }, mounted.size)
         : await filesystemEntries(mounted);
     const mount = sources.length;
-    const deferred = mounted.source.selection === 'dlc';
+    // only composed storages and CodeFS need to stay mounted between downloads
+    const deferredFilesystem = mounted.kind === 'filesystem' && section !== 'exefs';
+    const deferredStorage = mounted.kind === 'storage' &&
+      mounted.source.selection !== 'datapatch' &&
+      !(mounted.source.selection === 'update' && mounted.source.contentType === 1);
+    const deferred = deferredFilesystem || deferredStorage;
 
     if (deferred) await files.close(mounted);
 
     sources.push({
       handle: deferred ? a.root : mounted.handle,
-      kind: deferred ? 2 : mounted.kind === 'storage' ? 0 : 1,
+      kind: deferredFilesystem ? 3 : deferredStorage ? 2 : mounted.kind === 'storage' ? 0 : 1,
       attributes: deferred ? mounted.source.attributes : undefined,
+      proxyType: deferred ? mounted.source.proxyType : undefined,
+      programId: deferredFilesystem ? mounted.source.runtimeProgramId : undefined,
       size: mounted.size || 0,
       source: mounted.source,
     });
     views.push({
       path: prefix + '/' + section,
       mount,
-      kind: deferred ? 'deferred-storage' : mounted.kind,
+      kind: deferredFilesystem ? 'deferred-filesystem' : deferredStorage ? 'deferred-storage' : mounted.kind,
       entries,
       source: mounted.source,
     });
@@ -580,48 +595,86 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
     return grouped.values();
   }
 
+  async function mountPackage(prefix, candidates) {
+    const contents = new Map();
+    for (const candidate of candidates) {
+      const record = candidate.dataPatch || candidate.dlc || candidate.update || candidate.base;
+      for (const content of record.contents) {
+        // skip deltafragment, it isn't an fs
+        if (content.contentType === 6) continue;
+        const key = content.programIndex + ':' + content.contentType;
+        if (!contents.has(key)) contents.set(key, []);
+        contents.get(key).push({ ...candidate, content });
+      }
+    }
+
+    for (let choices of contents.values()) {
+      const { contentType, programIndex } = choices[0].content;
+      let path = prefix + '/program/' + programIndex;
+      // program and data can end up on top of the same folder. if that happens, shove them into subfolders
+      if ((contentType === 1 || contentType === 2) &&
+          contents.has(programIndex + ':1') && contents.has(programIndex + ':2')) {
+        path += contentType === 1 ? '/program' : '/data';
+      }
+      const sections = [
+        ['meta'], ['romfs', 'exefs', 'logo'], ['romfs'], ['control'], ['manual'], ['legal'],
+      ][contentType];
+      for (const section of sections) {
+        const mounted = await mountView(path, section, choices,
+          contentType === 1 && (section === 'romfs' || section === 'logo'));
+        choices = choices.filter(candidate => candidate.storage === mounted.source.storage);
+      }
+    }
+  }
+
   cancelled();
 
+  const bases = await discoverBase({ ...a, title });
+  cancelled();
   const updates = await discoverUpdates({ ...a, title });
   cancelled();
 
   const dlc = await discoverDlc({ ...a, title });
-  const installed = [4, 5, 2].map((storage) => ({ storage }));
-  const base = await mountView('/base', 'romfs', installed, true);
-  await mountView(
-    '/base',
-    'exefs',
-    installed.filter((candidate) => candidate.storage === base.source.storage),
-  );
+  cancelled();
+  const dataPatches = await discoverDataPatches({ ...a, title });
+  const [baseGroup] = groups(bases);
+  if (!baseGroup) throw new Error('No installed base content was found');
+  await mountPackage('/base', baseGroup.map(base => ({ storage: base.storage, base })));
 
   for (const group of groups(updates)) {
-    const prefix = '/updates/' + group[0].version;
-
-    const candidates = group.map((item) => ({
-      storage: item.storage,
-      update: { contentTitle: item.contentTitle, version: item.version },
-    }));
-    const update = await mountView(prefix, 'romfs', candidates);
-    await mountView(
-      prefix,
-      'exefs',
-      candidates.filter((candidate) => candidate.storage === update.source.storage),
-    );
+    await mountPackage('/updates/' + group[0].version,
+      group.map(update => ({ storage: update.storage, update })));
   }
 
   for (const group of groups(dlc)) {
     const first = group[0];
-    const prefix = '/dlc/' + first.contentTitle + '/' + first.version;
-    const candidates = group.map((item) => ({
-      storage: item.storage,
-      dlc: { contentTitle: item.contentTitle, version: item.version },
-    }));
-    await mountView(prefix, 'romfs', candidates);
+    const prefix = '/dlc/' + first.contentTitle + '/' + first.version + '/base';
+    await mountPackage(prefix, group.map(dlc => ({ storage: dlc.storage, dlc })));
+  }
+
+  for (const group of groups(dataPatches)) {
+    const patch = group[0];
+    const originals = dlc.filter(item => item.contentTitle === patch.dataTitle &&
+      (!item.dataPatchTitle || item.dataPatchTitle === patch.contentTitle));
+    if (!originals.length) throw new Error('No original DLC found for update ' + patch.contentTitle);
+
+    for (const originalGroup of groups(originals)) {
+      const original = originalGroup[0];
+      const prefix = '/dlc/' + original.contentTitle + '/' + original.version + '/updates/' + patch.version;
+      const candidates = group.flatMap(item => originalGroup.map(base => ({
+        storage: item.storage,
+        dataPatch: { ...item, original: base },
+      })));
+      await mountPackage(prefix, candidates);
+    }
   }
 
   const ncm = await a.service('ncm');
   const pinned = new Set();
-  const selectedSources = [...sources.map((item) => item.source), ...absentSources];
+  const selectedSources = [
+    ...sources.flatMap(item => [item.source, item.source.originalSource].filter(Boolean)),
+    ...absentSources,
+  ];
 
   for (const source of selectedSources) {
     cancelled();
@@ -646,17 +699,19 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false }) {
 
       const key = latest.data.subarray(0, 16);
 
-      const input = Buffer.alloc(24);
-      input[0] = source.contentType;
-      key.copy(input, 8);
-
-      const content = await a.s.ipc('FTP pin source content', database, 3, input);
-
-      if (content.result) throw resultError('FTP pin source content', content.result);
-
       for (const other of selectedSources.filter(
         (item) => item.storage === source.storage && (item.contentTitle || title) === contentTitle,
       )) {
+        const input = Buffer.alloc(24);
+        input[0] = other.contentType;
+        input[1] = other.programIndex;
+        key.copy(input, 8);
+        const content = await a.s.ipc('FTP pin source content', database, 20, input);
+        if (content.result) throw resultError('FTP pin source content', content.result);
+        if (!key.equals(other.metaKey) ||
+            !content.data.subarray(0, 16).equals(Buffer.from(other.contentId, 'hex'))) {
+          throw new Error('Installed content changed somehow: ' + contentTitle);
+        }
       }
     } finally {
       await a.s.close(database);

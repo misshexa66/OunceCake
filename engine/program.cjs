@@ -291,20 +291,9 @@ async function readLocation(a, resolver, programId) {
 async function selectPatch({ attachment: a, title, source, originalSource, operation }) {
   const runtimeProgramId = source.runtimeProgramId;
   const resolvers = new Map();
-  let original;
   let registered;
   let attempted = false;
-  let patch;
-
-  async function writeLocation(label, handle, input, location) {
-    const filename = Buffer.alloc(0x300);
-    filename.write(location.contentPath);
-    await a.s.write(a.s.base + 0x4000, filename);
-
-    const reply = await a.domain.send(a.s, label, handle, pathRequest(1, input, a.s.base + 0x4000, 0x300));
-
-    if (reply.result) throw resultError(label, reply.result);
-  }
+  let previous;
 
   return withCleanup(async () => {
     originalSource ||= await findOriginalContent({
@@ -315,29 +304,21 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
     });
 
     const lr = await a.service('lr');
-
-    async function resolver(storage) {
-      if (resolvers.has(storage)) return resolvers.get(storage);
-
-      const reply = await a.s.ipc('Open original location resolver', lr, 0, Buffer.from([storage]));
-
-      if (reply.result) throw resultError('Open original location resolver', reply.result);
-
-      const handle = a.domain.oneHandle(reply);
-      resolvers.set(storage, handle);
-      return handle;
-    }
-
-    original = await resolver(originalSource.storage);
-
-    const patchResolver = await resolver(source.storage);
-    const basePath = await readLocation(a, original, title);
-    const patchPath = await readLocation(a, patchResolver, source.contentTitle);
-
-    const base = { ...basePath, storage: originalSource.storage };
-    patch = { ...patchPath, storage: source.storage };
-
-    if (runtimeProgramId !== title) {
+    let original = originalSource;
+    let patch;
+    if (source.selection === 'update' && !source.programIndex) {
+      for (const storage of [originalSource.storage, source.storage]) {
+        if (resolvers.has(storage)) continue;
+        const opened = success(await a.s.ipc('Open original location resolver', lr, 0, Buffer.from([storage])),
+          'Open original location resolver');
+        resolvers.set(storage, a.domain.oneHandle(opened));
+      }
+      original = { ...await readLocation(a, resolvers.get(originalSource.storage), title), storage: originalSource.storage };
+      patch = { ...await readLocation(a, resolvers.get(source.storage), source.contentTitle), storage: source.storage };
+    } else {
+      const attributes = Buffer.alloc(16);
+      attributes[0] = source.attributes;
+      patch = { ...source, attributes: attributes.toString('hex') };
     }
 
     const opened = await a.s.ipc('Open registered patch resolver', lr, 1);
@@ -345,18 +326,21 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
     if (opened.result) throw resultError('Open registered patch resolver', opened.result);
 
     registered = a.domain.oneHandle(opened);
+    previous = await readLocation(a, registered, runtimeProgramId);
     
     const input = Buffer.alloc(32);
     idBytes(runtimeProgramId).copy(input);
     idBytes(title).copy(input, 8);
     Buffer.from(patch.attributes, 'hex').copy(input, 16);
+    const filename = Buffer.alloc(0x300);
+    filename.write(patch.contentPath);
+    await a.s.write(a.s.base + 0x4000, filename);
     attempted = true;
-    await writeLocation('Register owned patch location', registered, input, patch);
-
-    const actual = await readLocation(a, registered, runtimeProgramId);
+    success(await a.domain.send(a.s, 'Register owned patch location', registered,
+      pathRequest(1, input, a.s.base + 0x4000, 0x300)), 'Register owned patch location');
 
     const mount = () =>
-      operation({ runtimeProgramId, original: base, patch, originalContent: originalSource });
+      operation({ runtimeProgramId, original, patch, originalContent: originalSource });
     const result =
       runtimeProgramId === title
         ? await mount()
@@ -364,12 +348,25 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
             attachment: a,
             title,
             runtimeProgramId,
+            programIndex: source.programIndex,
             operation: mount,
           });
 
     return result;
   }, async () => {
     if (!attempted) return;
+    if (previous) {
+      const filename = Buffer.alloc(0x300);
+      filename.write(previous.contentPath);
+      await a.s.write(a.s.base + 0x4000, filename);
+      const input = Buffer.alloc(32);
+      idBytes(runtimeProgramId).copy(input);
+      idBytes(title).copy(input, 8);
+      Buffer.from(previous.attributes, 'hex').copy(input, 16);
+      success(await a.domain.send(a.s, 'Restore previous program location', registered,
+        pathRequest(1, input, a.s.base + 0x4000, 0x300)), 'Restore previous program location');
+      return;
+    }
     const actual = await readLocation(a, registered, runtimeProgramId);
     if (!actual) return;
     success(await a.s.ipc('Remove owned patch location', registered, 2, idBytes(runtimeProgramId)),
@@ -414,26 +411,18 @@ function createProgramMounts(attachment) {
     return domain.oneHandle(reply);
   };
 
-  async function assertNoPatch(title) {
-    const lr = await service('lr');
-    const opened = await s.ipc('Check base CodeFS selection', lr, 1);
-
-    if (opened.result) {
-      throw resultError('Check base CodeFS selection', opened.result);
-    }
-
-    const resolver = domain.oneHandle(opened);
-
-    try {
-    } finally {
-      await s.close(resolver);
-    }
-  }
-
-  const openCode = async (args) => {
-    await assertNoPatch(args.title);
-    return openCodeRaw(args);
-  };
+  const openCode = (args) => args.source.programIndex || args.source.selection === 'dlc' ? selectPatch({
+    attachment,
+    title: args.source.applicationTitle,
+    source: args.source,
+    originalSource: args.source,
+    operation: () => withUpdateLicenses({
+      attachment,
+      title: args.source.applicationTitle,
+      source: args.source,
+      operation: () => openCodeRaw(args),
+    }),
+  }) : openCodeRaw(args);
 
   const openUpdate = (args) => selectPatch({
     attachment,
@@ -472,4 +461,4 @@ function createProgramMounts(attachment) {
   return { openCode, openUpdate };
 }
 
-module.exports = { createProgramMounts, prepareInstalledLicense };
+module.exports = { createProgramMounts, prepareInstalledLicense, withUpdateLicenses };

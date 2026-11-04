@@ -45,22 +45,20 @@ typedef struct {
 _Static_assert(sizeof(ClientSlot)<=4096, "client slot ABI");
 static int io_enter(FtpConfig *c) {
     FtpConfig *owner=c->owner?(FtpConfig *)c->owner:c;
-    while(__atomic_exchange_n(&owner->io_lock,1,__ATOMIC_ACQUIRE)) {
-        if(c->stop)return 0;
-        // we share fs connections. everyone play nice and wait for the system to finish your request
+    while(!c->stop) {
+        if(!__atomic_exchange_n(&owner->io_lock,1,__ATOMIC_ACQUIRE))return 1;
+        // one complete open/read/close at a time, without waiting on a network client
         PollFd delay={-1,0,0};
         c->functions->poll(&delay,1,1);
     }
-    return 1;
+    return 0;
 }
 static void io_leave(FtpConfig *c) {
     FtpConfig *owner=c->owner?(FtpConfig *)c->owner:c;
     __atomic_store_n(&owner->io_lock,0,__ATOMIC_RELEASE);
 }
 static u32 ipc_call(FtpConfig *c,u32 handle) {
-    if(!io_enter(c))return BAD;
-    u32 result=c->functions->ipc(c->ipc_buffer,4096,handle);
-    io_leave(c);return result;
+    return c->functions->ipc(c->ipc_buffer,4096,handle);
 }
 
 static int wait_fd(FtpConfig *c,int fd,short events,int attempts) {
@@ -127,11 +125,15 @@ static int index_valid(Server *s) {
         if(n->type) {
             if(n->mount>=c->source_count)return 0;
             const Source *source=c->sources+n->mount;
-            if(!source->handle||source->kind>2||source->reserved||source->attributes>15||
-                (source->kind!=2&&source->attributes)||n->offset+n->size<n->offset)return 0;
-            if(source->kind!=1&&n->offset+n->size>source->size)return 0;
+            if(!source->handle||source->kind>3||source->reserved||source->attributes>15||source->proxy_type>6||
+                (source->kind<2&&(source->attributes||source->proxy_type)))return 0;
+            if(source->kind==0||source->kind==2) {
+                if(n->offset+n->size<n->offset||n->offset+n->size>source->size)return 0;
+            }
             if(source->kind&&(!string_valid(s,n->source_path,0x300)||
-                s->strings[n->source_path]!=(source->kind==1?'/':'@')))return 0;
+                s->strings[n->source_path]!=(source->kind==2?'@':'/')))return 0;
+            if(source->kind==3&&(n->offset>0xffffffffULL||!string_valid(s,(u32)n->offset,0x300)||
+                s->strings[n->offset]!='@'))return 0;
         }
     }
     return 1;
@@ -250,15 +252,27 @@ static u8 *response(FtpConfig *c,u32 *moved) {
     if(p[at+2]) {c->native_result=p[at+2];return 0;}
     return (u8 *)(p+at+4);
 }
-static u32 open_source(Server *s,const Node *n) {
-    FtpConfig *c=s->c;const char *filename=s->strings+n->source_path;u8 *name=c->ipc_buffer+4096;
-    const Source *source=c->sources+n->mount;
+static u32 open_path(FtpConfig *c,u32 parent,u32 command,const void *input,u32 input_bytes,const char *filename) {
+    u8 *name=c->ipc_buffer+4096;
     u64 bytes=length(filename);if(bytes>0x300)return 0;memset(name,0,0x301);memcpy(name,filename,bytes);
-    u32 input[2]={source->kind==1?1:source->attributes,6};
-    packet(c,source->kind==1?8:206,input,source->kind==1?4:8,0,0);u32 *p=(u32 *)c->ipc_buffer;u64 a=(u64)name;
+    packet(c,command,input,input_bytes,0,0);u32 *p=(u32 *)c->ipc_buffer;u64 a=(u64)name;
     p[0]=4|1u<<16;p[2]=(0x301u<<16)|((u32)((a>>36)&7)<<6)|((u32)((a>>32)&15)<<12);p[3]=(u32)a;
-    c->native_result=ipc_call(c,source->handle);if(c->native_result)return 0;
+    c->native_result=ipc_call(c,parent);if(c->native_result)return 0;
     u32 handle;if(!response(c,&handle)||!handle)return 0;
+    return handle;
+}
+static u32 open_source(Server *s,const Node *n) {
+    FtpConfig *c=s->c;const Source *source=c->sources+n->mount;
+    u32 parent=source->handle;
+    if(source->kind==3) {
+        u64 input[2]={source->attributes|((u64)source->proxy_type<<32),source->program_id};
+        parent=open_path(c,parent,10,input,16,s->strings+n->offset);
+        if(!parent)return 0;
+    }
+    u32 input[2]={source->kind==2?source->attributes:1,source->proxy_type};
+    u32 handle=open_path(c,parent,source->kind==2?206:8,input,source->kind==2?8:4,s->strings+n->source_path);
+    if(source->kind==3)c->functions->close_handle(parent);
+    if(!handle)return 0;
     if(source->kind==2) {
         packet(c,4,0,0,0,0);c->native_result=ipc_call(c,handle);
         u32 moved=0;u8 *out=c->native_result?0:response(c,&moved);
@@ -277,6 +291,14 @@ static int read_storage(Server *s,u32 handle,int file,u64 offset,u32 count) {
     if(file&&*(u64 *)out!=count)return 0;
     return 1;
 }
+static int read_source(Server *s,const Node *n,u64 offset,u32 count) {
+    FtpConfig *c=s->c;const Source *source=c->sources+n->mount;
+    if(!io_enter(c))return 0;
+    u32 handle=source->kind?open_source(s,n):source->handle;
+    int ok=handle&&read_storage(s,handle,source->kind==1||source->kind==3,offset,count);
+    if(source->kind&&handle&&c->functions->close_handle(handle))ok=0;
+    io_leave(c);return ok;
+}
 static int retrieve(Client *p,const char *name) {
     if(!p->binary) {
         passive_close(p);p->restart=0;
@@ -287,21 +309,20 @@ static int retrieve(Client *p,const char *name) {
     const Node *n=s->nodes+id;const Source *source=c->sources+n->mount;
     if(restart>n->size)return reply(p,"551 Restart offset exceeds file size\r\n");
     if(p->passive<0)return reply(p,"425 Use PASV or EPSV first\r\n");
-    u32 handle=source->kind?open_source(s,n):source->handle;
-    if(!handle)return reply(p,"550 Source file could not be opened\r\n");
-    if(!reply(p,"150 Opening binary data connection\r\n")) {if(source->kind)c->functions->close_handle(handle);return 0;}
+    if(!reply(p,"150 Opening binary data connection\r\n"))return 0;
     int fd=data_accept(p),ok=fd>=0;u64 offset=restart;
-    if(source->kind)s->cache_source=NONE;
+    if(source->kind==1||source->kind==3)s->cache_source=NONE;
     while(ok&&offset<n->size&&!c->stop) {
         u64 count,inside=0;
-        if(source->kind==1) {
+        if(source->kind==1||source->kind==3) {
             count=n->size-offset;if(count>c->data_bytes)count=c->data_bytes;
-            ok=read_storage(s,handle,1,offset,(u32)count);
+            ok=read_source(s,n,offset,(u32)count);
         } else {
             u64 at=n->offset+offset,start=(at/c->data_bytes)*c->data_bytes;
             if(s->cache_source!=n->mount||s->cache_offset!=start) {
+                s->cache_source=NONE;
                 count=source->size-start;if(count>c->data_bytes)count=c->data_bytes;
-                ok=read_storage(s,handle,0,start,(u32)count);if(!ok)break;
+                ok=read_source(s,n,start,(u32)count);if(!ok)break;
                 s->cache_source=n->mount;s->cache_offset=start;s->cache_bytes=count;
             }
             inside=at-s->cache_offset;count=s->cache_bytes-inside;if(count>n->size-offset)count=n->size-offset;
@@ -310,7 +331,6 @@ static int retrieve(Client *p,const char *name) {
         offset+=count;
     }
     if(fd>=0)c->functions->close(fd);
-    if(source->kind) {if(c->functions->close_handle(handle))ok=0;s->cache_source=NONE;}
     if(ok&&offset==n->size&&!c->stop) {c->files++;return reply(p,"226 Transfer complete\r\n");}
     return reply(p,fd<0?"425 Data connection unavailable\r\n":"426 Transfer interrupted\r\n");
 }

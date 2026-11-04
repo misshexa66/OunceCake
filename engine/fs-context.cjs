@@ -318,17 +318,14 @@ async function programMapReader(attachment) {
   return { entries };
 }
 
-async function withProgramIndexMap({ attachment: a, title, runtimeProgramId, operation }) {
+async function withProgramIndexMap({ attachment: a, title, runtimeProgramId, programIndex = 0, operation }) {
   const reader = await programMapReader(a);
   const before = await reader.entries();
-  const mapping = { programId: runtimeProgramId, applicationId: title, programIndex: 0, flags: 0 };
   const existing = before.find((row) => row.programId === runtimeProgramId);
-  if (existing) {
-    return withCleanup(operation, async () => {
-    });
-  }
+  if (existing && existing.applicationId === title && existing.programIndex === programIndex) return operation();
+  const mapping = { programId: runtimeProgramId, applicationId: title, programIndex, flags: existing?.flags || 0 };
   // fs 810 counts 0 as a no-op
-  const active = normalized([...before, mapping]);
+  const active = normalized([...before.filter(row => row.programId !== runtimeProgramId), mapping]);
   let attempted = false;
   async function register(rows, label) {
     const bytes = mapBytes(rows);

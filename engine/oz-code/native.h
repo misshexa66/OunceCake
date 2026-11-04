@@ -25,8 +25,11 @@ typedef struct {
     int (*thread_create)(u64 *, void *, void *(*)(void *), void *);
     int (*thread_join)(u64, void **);
 } FtpFunctions;
-// kinds: 0 = base/update romfs, 1 = exefs, 2 = dlc romfs
-typedef struct {u32 handle; u8 kind, attributes; u16 reserved; u64 size;} Source;
+// kinds: 0 = held storage, 1 = held filesystem, 2 = storage by path, 3 = filesystem by path
+typedef struct {
+    u32 handle; u8 kind, attributes, proxy_type, reserved;
+    union {u64 size; u64 program_id;};
+} Source;
 typedef struct {
     u32 parent, child, next, type, name_offset, name_length, mount, source_path;
     u64 offset, size;
