@@ -7,26 +7,38 @@ const { discoverGames } = require('./engine/content.cjs');
 const { prepareGame } = require('./engine/mounts.cjs');
 const { deployFtp, readImage } = require('./engine/ftp.cjs');
 
-const USAGE = 'Usage: node ouncecake.cjs <run-directory> [title-id] [--port 2121] [--latest-only] [--content-only] [--tar]\n' +
-              '--latest-only: only show the newest update and newest DLC versions (hides the base\n' +
-              '               game and unpatched DLC when an update exists, since updates are dumped merged)\n' +
-              '--content-only: only mount romfs and exefs (skips meta, logo, control, manual and legal)\n' +
+const USAGE = 'Usage: node ouncecake.cjs <run-directory> [title-id] [--latest-only] [--content-only] [--tar] [--port 2121]\n' +
               'Use the run dir given by ns2jb (Run folder: <whatever>)\n' +
               'You can also provide a title ID to skip the selection menu and just mount a specific game\n' +
-              '--tar exposes the data as tar files instead of raw files, allowing for faster downloads\n';
+              '\n' +
+              '--latest-only   only show the newest update and newest DLC versions (hides the base\n' +
+              '                game and unpatched DLC when an update exists, since updates are dumped merged)\n' +
+              '--content-only  only mount romfs and exefs (skips meta, logo, control, manual and legal)\n' +
+              '--tar           exposes the data as tar files instead of raw files, allowing for faster downloads\n' +
+              '--port <port>   FTP port to listen on (default 2121)\n';
 
 function getArgs(argv) {
   const args = [];
-  let port = 2121;
-  let tar = false;
   let latestOnly = false;
   let contentOnly = false;
+  let tar = false;
+  let port = 2121;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
 
     if (a === '--help') {
       return { help: true };
+    }
+
+    if (a === '--latest-only') {
+      latestOnly = true;
+      continue;
+    }
+
+    if (a === '--content-only') {
+      contentOnly = true;
+      continue;
     }
 
     if (a === '--tar') {
@@ -39,16 +51,6 @@ function getArgs(argv) {
       if (!Number.isInteger(port) || port < 1024 || port > 65535) {
         throw new Error('Invalid --port value\n' + USAGE);
       }
-      continue;
-    }
-
-    if (a === '--content-only') {
-      contentOnly = true;
-      continue;
-    }
-
-    if (a === '--latest-only') {
-      latestOnly = true;
       continue;
     }
 
@@ -68,7 +70,7 @@ function getArgs(argv) {
   }
 
   const title = args.length === 2 ? titleId(args[1]) : undefined;
-  return { run: path.resolve(args[0]), title, port, tar, latestOnly, contentOnly };
+  return { run: path.resolve(args[0]), title, latestOnly, contentOnly, tar, port };
 }
 
 const storageNames = { 2: 'Game card', 4: 'Internal', 5: 'SD' };
@@ -155,7 +157,7 @@ async function main(argv = process.argv.slice(2)) {
       if (!selected || shouldStop()) return;
       title = selected.title;
     }
-    const prepared = await prepareGame({ attachment, title, latestOnly, contentOnly, shouldStop, tar: options.tar });
+    const prepared = await prepareGame({ attachment, title, latestOnly, contentOnly, tar: options.tar, shouldStop });
     if (shouldStop()) return;
     server = await deployFtp({ attachment, image, ...prepared, port });
     console.log('FTP up! ftp://<switch 2 ip>:' + port);

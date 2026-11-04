@@ -530,7 +530,7 @@ function buildIndex(views, { tar = false } = {}) {
   return bytes;
 }
 
-async function prepareGame({ attachment: a, title, latestOnly = false, contentOnly = false, shouldStop = () => false, tar = false }) {
+async function prepareGame({ attachment: a, title, latestOnly = false, contentOnly = false, tar = false, shouldStop = () => false }) {
   const views = [];
   const sources = [];
   const absentSources = [];
