@@ -275,7 +275,7 @@ async function readLocation(a, resolver, programId, command = 0) {
     fixedOutput(command, idBytes(programId), address, size),
   );
 
-  const absent = command === 0 ? [0x408, 0x1408] : [0xc08];
+  const absent = command === 0 || command === 16 ? [0x408, 0x1408] : [0xc08];
   if (absent.includes(r.result & 0x3fffff)) return null;
 
   if (r.result) throw resultError('Resolve selected update location', r.result);
@@ -308,12 +308,17 @@ async function writeLocation(a, resolver, programId, title, location, command = 
 
 async function selectPatch({ attachment: a, title, source, originalSource, operation }) {
   const runtimeProgramId = source.runtimeProgramId;
+  const indexedUpdate = source.selection === 'update' && Boolean(source.programIndex);
   const resolvers = new Map();
+  const originalPaths = [];
   let registered;
   let attempted = false;
   let previous;
 
   return withCleanup(async () => {
+    if (indexedUpdate && originalSource?.programIndex !== source.programIndex) {
+      throw new Error('No matching base program found for update index ' + source.programIndex);
+    }
     originalSource ||= await findOriginalContent({
       s: a.s,
       domain: a.domain,
@@ -323,18 +328,19 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
 
     const lr = await a.service('lr');
     let original = originalSource;
-    let patch;
-    if (source.selection === 'update' && !source.programIndex) {
-      for (const storage of [originalSource.storage, source.storage]) {
+    let patch = { ...source, ...contentLocation(source) };
+    if (source.selection === 'update') {
+      const storages = indexedUpdate ? [originalSource.storage] : [originalSource.storage, source.storage];
+      for (const storage of storages) {
         if (resolvers.has(storage)) continue;
         const opened = success(await a.s.ipc('Open original location resolver', lr, 0, Buffer.from([storage])),
           'Open original location resolver');
         resolvers.set(storage, a.domain.oneHandle(opened));
       }
-      original = { ...await readLocation(a, resolvers.get(originalSource.storage), title), storage: originalSource.storage };
-      patch = { ...await readLocation(a, resolvers.get(source.storage), source.contentTitle), storage: source.storage };
-    } else {
-      patch = { ...source, ...contentLocation(source) };
+      if (!indexedUpdate) {
+        original = { ...await readLocation(a, resolvers.get(originalSource.storage), title), storage: originalSource.storage };
+        patch = { ...await readLocation(a, resolvers.get(source.storage), source.contentTitle), storage: source.storage };
+      }
     }
 
     const opened = await a.s.ipc('Open registered patch resolver', lr, 1);
@@ -346,6 +352,21 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
     
     attempted = true;
     await writeLocation(a, registered, runtimeProgramId, title, patch, 1, 'Register owned patch location');
+
+    if (indexedUpdate) {
+      const resolver = resolvers.get(originalSource.storage);
+      const programId = originalSource.runtimeProgramId;
+      const selected = contentLocation(originalSource);
+      for (const path of [{ read: 0, write: 10, erase: 12 }, { read: 16, write: 18, erase: 19 }]) {
+        path.previous = await readLocation(a, resolver, programId, path.read);
+        originalPaths.push(path);
+      }
+      for (const path of originalPaths) {
+        if (path.previous?.contentPath === selected.contentPath && path.previous.attributes === selected.attributes) continue;
+        path.changed = true;
+        await writeLocation(a, resolver, programId, title, selected, path.write, 'Select original program location');
+      }
+    }
 
     const mount = () =>
       operation({ runtimeProgramId, original, patch, originalContent: originalSource });
@@ -361,7 +382,19 @@ async function selectPatch({ attachment: a, title, source, originalSource, opera
           });
 
     return result;
-  }, async () => {
+  }, () => cleanup(originalPaths.map(path => async () => {
+    if (!path.changed) return;
+    const resolver = resolvers.get(originalSource.storage);
+    const programId = originalSource.runtimeProgramId;
+    // Restore normal before debug so the debug fallback sees the restored path.
+    success(await a.s.ipc('Remove temporary original program location', resolver,
+      path.erase, idBytes(programId)), 'Remove temporary original program location');
+    if (!path.previous) return;
+    const restored = await readLocation(a, resolver, programId, path.read);
+    if (restored?.contentPath !== path.previous.contentPath || restored.attributes !== path.previous.attributes) {
+      await writeLocation(a, resolver, programId, title, path.previous, path.write, 'Restore original program location');
+    }
+  })), async () => {
     if (!attempted) return;
     if (previous) {
       await writeLocation(a, registered, runtimeProgramId, title, previous, 1, 'Restore previous program location');
