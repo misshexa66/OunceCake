@@ -57,6 +57,7 @@ const names = new Map([
   [0x07d802, 'NcaExternalKeyNotFound'],
   [0x1fb402, 'RomNcaHeaderSignature1VerificationFailed'],
   [0x235e02, 'InvalidNcaId'],
+  [0x244802, 'PartitionSignatureVerificationFailed'],
   [0x320002, 'PermissionDenied'],
   [0x021005, 'SdCardContentMetaDatabaseNotActive'],
   [0x020a05, 'GameCardContentMetaDatabaseNotActive'],

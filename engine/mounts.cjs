@@ -39,6 +39,8 @@ function createGameFiles(attachment) {
         content,
       });
 
+      if (base && source.contentType === 1) originals.set(source.programIndex, source);
+
       const { contentPath, attributes } = source;
       let composed = false;
 
@@ -106,7 +108,6 @@ function createGameFiles(attachment) {
         mounted.size = safeSize(await gameFs.size(handle));
       }
 
-      if (base && source.contentType === 1) originals.set(source.programIndex, source);
       if (base && source.contentType === 4) originalManuals.set(source.programIndex, source);
       return mounted;
     } catch (error) {
@@ -196,7 +197,7 @@ function name(bytes, root = false) {
   return value;
 }
 
-async function readRomfs(read, storageSize) {
+async function readRomfs(read, storageSize, allowIncomplete = false) {
   checkRomfs(Number.isSafeInteger(storageSize) && storageSize >= 0x50, 'storage size');
 
   async function exact(offset, length) {
@@ -217,7 +218,16 @@ async function readRomfs(read, storageSize) {
   }
 
   const header = await exact(0, 0x50);
-  const h = Array.from({ length: 10 }, (_, i) => integer(header.readBigUInt64LE(i * 8)));
+  const values = Array.from({ length: 10 }, (_, i) => header.readBigUInt64LE(i * 8));
+  if (allowIncomplete) {
+    if (values.every(value => value === 0n)) {
+      return { requiresUpdate: true, reason: 'empty RomFS header' };
+    }
+    if (values.some(value => value > BigInt(Number.MAX_SAFE_INTEGER))) {
+      return { requiresUpdate: true, reason: 'RomFS offset exceeds numeric precision' };
+    }
+  }
+  const h = values.map(integer);
   checkRomfs(h[0] === 0x50, 'header size');
 
   const ranges = [];
@@ -305,8 +315,14 @@ async function readRomfs(read, storageSize) {
       const e = entry(files, file, 32);
       checkRomfs(e.bytes.readUInt32LE() === dir.offset, 'file parent');
 
-      const relative = integer(e.bytes.readBigUInt64LE(8));
-      const size = integer(e.bytes.readBigUInt64LE(16));
+      const relativeValue = e.bytes.readBigUInt64LE(8);
+      const sizeValue = e.bytes.readBigUInt64LE(16);
+      if (allowIncomplete && (relativeValue > BigInt(Number.MAX_SAFE_INTEGER) ||
+          sizeValue > BigInt(Number.MAX_SAFE_INTEGER))) {
+        return { requiresUpdate: true, reason: 'RomFS offset exceeds numeric precision' };
+      }
+      const relative = integer(relativeValue);
+      const size = integer(sizeValue);
       const offset = h[9] + relative;
       checkRomfs(Number.isSafeInteger(offset + size) && offset + size <= storageSize, 'file extent');
       checkRomfs(
@@ -517,6 +533,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
   const views = [];
   const sources = [];
   const absentSources = [];
+  const unavailableBaseSections = [];
   const prepared = new Set();
   const files = createGameFiles(a);
 
@@ -589,18 +606,38 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
       }
     }
 
-    if (!mounted)
+    if (!mounted) {
+      if (candidates[0].base && section === 'exefs' && lastError?.nativeResult?.canonical === 0x244802) {
+        return { source: lastError.source, requiresUpdate: true, reason: lastError.message };
+      }
       throw new Error(
         'Could not prepare ' + prefix + '/' + section + ': ' + (lastError?.message || 'No installed content'),
+        { cause: lastError },
       );
+    }
 
-    const entries =
-      mounted.kind === 'storage'
-        ? await readRomfs((offset, length) => {
-            cancelled();
-            return files.read(mounted, offset, length);
-          }, mounted.size)
-        : await filesystemEntries(mounted);
+    let entries;
+    try {
+      if (mounted.kind === 'storage') {
+        const read = (offset, length) => {
+          cancelled();
+          return files.read(mounted, offset, length);
+        };
+        entries = await readRomfs(read, mounted.size,
+          Boolean(candidates[0].base && mounted.source.contentType === 1));
+      } else {
+        entries = await filesystemEntries(mounted);
+      }
+    } catch (error) {
+      error.source = mounted.source;
+      await cleanup([() => files.close(mounted)], error);
+    }
+
+    if (entries.requiresUpdate) {
+      await files.close(mounted);
+      return { source: mounted.source, ...entries };
+    }
+
     const mount = sources.length;
     // composed stuff (i.e game updates mounted on base games) and codefs need to stay mounted
     const deferredFilesystem = mounted.kind === 'filesystem' && section !== 'exefs' && !mounted.composed;
@@ -673,6 +710,21 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
       for (const section of sections) {
         const mounted = await mountView(path, section, choices,
           contentType === 1 && (section === 'romfs' || section === 'logo'));
+        cancelled();
+        if (mounted.requiresUpdate) {
+          const source = mounted.source;
+          const matchingUpdate = updates.some(update => update.contents.some(content =>
+            content.contentType === 1 && content.programIndex === source.programIndex));
+          if (!matchingUpdate) {
+            throw new Error('Can\'t mount ' + path + '/' + section +
+              ' on its own, and the correct update is missing: ' + mounted.reason);
+          }
+
+          unavailableBaseSections.push({ path: path + '/' + section, section, source,
+            reason: mounted.reason });
+          console.log('Can\'t mount ' + path + '/' + section +
+            ', checking if there\'s an upadte...');
+        }
         choices = choices.filter(candidate => candidate.storage === mounted.source.storage);
       }
     }
@@ -695,6 +747,19 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
   for (const group of groups(updates)) {
     await mountPackage('/updates/' + group[0].version,
       group.map(update => ({ storage: update.storage, update })));
+  }
+
+  // if base is fucky, try update. might be sparse.
+  for (const missing of unavailableBaseSections) {
+    const replacement = views.find(view => view.source.selection === 'update' &&
+      view.source.contentType === 1 && view.source.programIndex === missing.source.programIndex &&
+      view.path.endsWith('/' + missing.section) &&
+      view.source.originalSource?.storage === missing.source.storage &&
+      view.source.originalSource?.contentId === missing.source.contentId);
+    if (!replacement) {
+      throw new Error('No suitable update for ' + missing.path + ': ' + missing.reason);
+    }
+    console.log(missing.path + ' missing, trying ' + replacement.path);
   }
 
   for (const group of groups(dlc)) {
