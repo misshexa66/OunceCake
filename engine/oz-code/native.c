@@ -167,7 +167,7 @@ static int index_valid(Server *s) {
         if(n->type) {
             if(n->mount>=c->source_count)return 0;
             const Source *source=c->sources+n->mount;
-            if(!source->handle||source->kind>3||source->reserved||source->attributes>15||source->proxy_type>6||
+            if(!source->handle||source->kind>3||source->reserved||source->padding||source->attributes>15||source->proxy_type>6||
                 (source->kind<2&&(source->attributes||source->proxy_type)))return 0;
             if(n->type==NODE_TAR) {
                 if(!archive_valid(s,n,&member_cursor))return 0;
@@ -279,70 +279,87 @@ static int list(Client *p,const char *name,int mode) {
 }
 
 // put together the fs ipc requests for downloads
-static void packet(FtpConfig *c,u32 command,const void *input,u32 bytes,u8 *output,u32 count) {
-    u32 *p=(u32 *)c->ipc_buffer;memset(p,0,256);p[0]=4|(count?1u<<24:0);p[1]=(32+bytes+3)/4;
+static FsObject source_object(const Source *source) {return (FsObject){source->handle,source->object_id};}
+static void packet(FtpConfig *c,FsObject object,u32 command,const void *input,u32 bytes,u8 *output,u32 count) {
+    u32 *p=(u32 *)c->ipc_buffer;memset(p,0,256);p[0]=4|(count?1u<<24:0);p[1]=(32+bytes+3)/4+(object.object_id?4:0);
     u32 at=16;
     if(count) {u64 a=(u64)output;p[2]=count;p[3]=(u32)a;p[4]=1u|((u32)(a>>36)<<2)|((u32)((a>>32)&15)<<28);at=32;}
+    if(object.object_id) {*(u32 *)(c->ipc_buffer+at)=1|((16+bytes)<<16);*(u32 *)(c->ipc_buffer+at+4)=object.object_id;at+=16;}
     *(u32 *)((u8 *)p+at)=0x49434653;*(u32 *)((u8 *)p+at+8)=command;memcpy((u8 *)p+at+16,input,bytes);
 }
-static u8 *response(FtpConfig *c,u32 *moved) {
-    u32 *p=(u32 *)c->ipc_buffer,at=2;*moved=0;
+static u8 *response(FtpConfig *c,FsObject parent,u32 data_bytes,FsObject *child) {
+    u32 *p=(u32 *)c->ipc_buffer,at=2,moved=0,objects=0;*child=(FsObject){0};
     if(p[1]>>31) {
         u32 special=p[at++],copies=(special>>1)&15,moves=(special>>5)&15;
         if(special&1)at+=2;
-        if(copies||moves>1)return 0;
-        if(moves)*moved=p[at++];
+        if(copies||moves>1||(parent.object_id&&moves))return 0;
+        if(moves)moved=p[at++];
     }
     at+=((p[0]>>16)&15)*2+(((p[0]>>20)&15)+((p[0]>>24)&15)+((p[0]>>28)&15))*3;at=(at+3)&~3u;
+    if(parent.object_id) {if(at+4>64)return 0;objects=p[at];at+=4;}
     if(at+4>64||p[at]!=0x4f434653)return 0;
     if(p[at+2]) {c->native_result=p[at+2];return 0;}
+    if(at*4+16+data_bytes+(u64)objects*4>256||objects>1)return 0;
+    if(objects) {
+        u32 id=*(u32 *)((u8 *)(p+at+4)+data_bytes);if(!id)return 0;
+        *child=(FsObject){parent.handle,id};
+    } else if(moved)*child=(FsObject){moved,0};
     return (u8 *)(p+at+4);
 }
-static u32 open_path(FtpConfig *c,u32 parent,u32 command,const void *input,u32 input_bytes,const char *filename) {
-    u8 *name=c->ipc_buffer+4096;
-    u64 bytes=length(filename);if(bytes>0x300)return 0;memset(name,0,0x301);memcpy(name,filename,bytes);
-    packet(c,command,input,input_bytes,0,0);u32 *p=(u32 *)c->ipc_buffer;u64 a=(u64)name;
-    p[0]=4|1u<<16;p[2]=(0x301u<<16)|((u32)((a>>36)&7)<<6)|((u32)((a>>32)&15)<<12);p[3]=(u32)a;
-    c->native_result=ipc_call(c,parent);if(c->native_result)return 0;
-    u32 handle;if(!response(c,&handle)||!handle)return 0;
-    return handle;
+static u32 close_object(FtpConfig *c,FsObject object) {
+    if(!object.object_id)return c->functions->close_handle(object.handle);
+    u32 *p=(u32 *)c->ipc_buffer;memset(p,0,256);p[0]=4;p[1]=8;p[4]=2;p[5]=object.object_id;
+    return ipc_call(c,object.handle);
 }
-static u32 open_source(Server *s,const Node *n) {
+static int close_reader_object(FtpConfig *c,FsObject object) {
+    if(!io_enter(c))return 0;
+    int ok=!close_object(c,object);io_leave(c);return ok;
+}
+static FsObject open_path(FtpConfig *c,FsObject parent,u32 command,const void *input,u32 input_bytes,const char *filename) {
+    u8 *name=c->ipc_buffer+4096;
+    u64 bytes=length(filename);if(bytes>0x300)return (FsObject){0};memset(name,0,0x301);memcpy(name,filename,bytes);
+    packet(c,parent,command,input,input_bytes,0,0);u32 *p=(u32 *)c->ipc_buffer;u64 a=(u64)name;
+    p[0]=4|1u<<16;p[2]=(0x301u<<16)|((u32)((a>>36)&7)<<6)|((u32)((a>>32)&15)<<12);p[3]=(u32)a;
+    c->native_result=ipc_call(c,parent.handle);if(c->native_result)return (FsObject){0};
+    FsObject object;if(!response(c,parent,0,&object))return (FsObject){0};
+    return object;
+}
+static FsObject open_source(Server *s,const Node *n) {
     FtpConfig *c=s->c;const Source *source=c->sources+n->mount;
-    u32 parent=source->handle;
+    FsObject parent=source_object(source);
     if(source->kind==3) {
         u64 input[2]={source->attributes|((u64)source->proxy_type<<32),source->program_id};
         parent=open_path(c,parent,10,input,16,s->strings+n->offset);
-        if(!parent)return 0;
+        if(!parent.handle)return (FsObject){0};
     }
     u32 input[2]={source->kind==2?source->attributes:1,source->proxy_type};
-    u32 handle=open_path(c,parent,source->kind==2?206:8,input,source->kind==2?8:4,s->strings+n->source_path);
-    if(source->kind==3)c->functions->close_handle(parent);
-    if(!handle)return 0;
+    FsObject object=open_path(c,parent,source->kind==2?206:8,input,source->kind==2?8:4,s->strings+n->source_path);
+    if(source->kind==3)close_object(c,parent);
+    if(!object.handle)return object;
     if(source->kind==2) {
-        packet(c,4,0,0,0,0);c->native_result=ipc_call(c,handle);
-        u32 moved=0;u8 *out=c->native_result?0:response(c,&moved);
-        if(!out||moved||*(u64 *)out!=source->size) {
-            if(moved)c->functions->close_handle(moved);
-            c->functions->close_handle(handle);return 0;
+        packet(c,object,4,0,0,0,0);c->native_result=ipc_call(c,object.handle);
+        FsObject child={0};u8 *out=c->native_result?0:response(c,object,8,&child);
+        if(!out||child.handle||*(u64 *)out!=source->size) {
+            if(child.handle)close_object(c,child);
+            close_object(c,object);return (FsObject){0};
         }
     }
-    return handle;
+    return object;
 }
-static int read_storage(Server *s,u32 handle,int file,u64 offset,u32 count) {
+static int read_storage(Server *s,FsObject object,int file,u64 offset,u32 count) {
     FtpConfig *c=s->c;u64 input[3]={file?0:offset,file?offset:count,count};
-    packet(c,0,input,file?24:16,c->data,count);
-    c->native_result=ipc_call(c,handle);if(c->native_result)return 0;
-    u32 moved;u8 *out=response(c,&moved);if(!out||moved)return 0;
+    packet(c,object,0,input,file?24:16,c->data,count);
+    c->native_result=ipc_call(c,object.handle);if(c->native_result)return 0;
+    FsObject child;u8 *out=response(c,object,file?8:0,&child);if(!out||child.handle)return 0;
     if(file&&*(u64 *)out!=count)return 0;
     return 1;
 }
 static int read_source(Server *s,const Node *n,u64 offset,u32 count) {
     FtpConfig *c=s->c;const Source *source=c->sources+n->mount;
     if(!io_enter(c))return 0;
-    u32 handle=source->kind?open_source(s,n):source->handle;
-    int ok=handle&&read_storage(s,handle,source->kind==1||source->kind==3,offset,count);
-    if(source->kind&&handle&&c->functions->close_handle(handle))ok=0;
+    FsObject object=source->kind?open_source(s,n):source_object(source);
+    int ok=object.handle&&read_storage(s,object,source->kind==1||source->kind==3,offset,count);
+    if(source->kind&&object.handle&&close_object(c,object))ok=0;
     io_leave(c);return ok;
 }
 #include "tar.h"
@@ -475,7 +492,7 @@ static void collect_clients(FtpConfig *c,int stop) {
 }
 void *ftp_main(void *configuration) {
     FtpConfig *c=configuration;
-    if(!c||c->magic!=CFG_MAGIC||c->version!=1)return (void *)(u64)BAD;
+    if(!c||c->magic!=CFG_MAGIC||c->version!=2)return (void *)(u64)BAD;
     Server s;memset(&s,0,sizeof(s));s.c=c;s.cache_source=NONE;c->state=0;c->result=BAD;
     if(!c->functions||!c->ipc_buffer||!c->data||c->data_bytes<4096||c->data_bytes>0x400000||
         !c->port||c->port>65535||!c->slots||!c->reserved||c->reserved>FTP_MAX_CLIENTS||

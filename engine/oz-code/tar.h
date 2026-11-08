@@ -7,7 +7,7 @@ typedef struct {
 typedef struct {
     Server *s;
     const Node *archive;
-    u32 handle;
+    FsObject object;
 } TarReader;
 
 static void tar_octal(u8 *out,u32 bytes,u64 value) {
@@ -51,18 +51,18 @@ static int tar_emit(TarOutput *out,const u8 *data,u64 bytes) {
 }
 
 static int tar_open(TarReader *reader) {
-    if(reader->handle)return 1;
+    if(reader->object.handle)return 1;
     Server *s=reader->s;FtpConfig *c=s->c;
     const Source *source=c->sources+reader->archive->mount;
-    if(source->kind<2)reader->handle=source->handle;
-    else if(source->kind==2)reader->handle=open_source(s,reader->archive);
+    if(source->kind<2)reader->object=source_object(source);
+    else if(source->kind==2)reader->object=open_source(s,reader->archive);
     else {
         u64 input[2]={source->attributes|((u64)source->proxy_type<<32),source->program_id};
-        reader->handle=open_path(c,source->handle,10,input,16,s->strings+reader->archive->source_path);
+        reader->object=open_path(c,source_object(source),10,input,16,s->strings+reader->archive->source_path);
     }
-    return reader->handle!=0;
+    return reader->object.handle!=0;
 }
-static int tar_chunk(TarReader *reader,const TarMember *m,u32 *file,u64 offset,u64 *inside,u64 *bytes) {
+static int tar_chunk(TarReader *reader,const TarMember *m,FsObject *file,u64 offset,u64 *inside,u64 *bytes) {
     Server *s=reader->s;FtpConfig *c=s->c;u32 mount=reader->archive->mount;
     const Source *source=c->sources+mount;
     *inside=0;*bytes=m->size-offset;
@@ -70,9 +70,9 @@ static int tar_chunk(TarReader *reader,const TarMember *m,u32 *file,u64 offset,u
         if(*bytes>c->data_bytes)*bytes=c->data_bytes;
         if(!io_enter(c))return 0;
         int ok=tar_open(reader);
-        if(ok&&!*file) {
-            u32 mode=1;*file=open_path(c,reader->handle,8,&mode,4,s->strings+m->source_path);
-            ok=*file!=0;
+        if(ok&&!file->handle) {
+            u32 mode=1;*file=open_path(c,reader->object,8,&mode,4,s->strings+m->source_path);
+            ok=file->handle!=0;
         }
         if(ok)ok=read_storage(s,*file,1,offset,(u32)*bytes);
         io_leave(c);s->cache_source=NONE;return ok;
@@ -82,7 +82,7 @@ static int tar_chunk(TarReader *reader,const TarMember *m,u32 *file,u64 offset,u
         s->cache_source=NONE;
         u64 count=source->size-start;if(count>c->data_bytes)count=c->data_bytes;
         if(!io_enter(c))return 0;
-        int ok=tar_open(reader)&&read_storage(s,reader->handle,0,start,(u32)count);
+        int ok=tar_open(reader)&&read_storage(s,reader->object,0,start,(u32)count);
         io_leave(c);if(!ok)return 0;
         s->cache_source=mount;s->cache_offset=start;s->cache_bytes=count;
     }
@@ -99,8 +99,8 @@ static int tar_transfer(Server *s,const Node *archive,int fd,u64 restart) {
     u32 low=0,high=count;
     while(low<high) {u32 mid=low+(high-low)/2;if(members[mid].end<=restart)low=mid+1;else high=mid;}
     TarOutput out={c,fd,0,low<count?members[low].start:archive->size-1024,restart};
-    TarReader reader={s,archive,0};
-    int ok=1;u32 file=0;
+    TarReader reader={s,archive,{0}};
+    int ok=1;FsObject file={0};
     for(u32 i=low;i<count&&ok&&!c->stop;i++) {
         const TarMember *m=members+i;u8 header[512];
         if(m->pax_bytes) {
@@ -116,11 +116,11 @@ static int tar_transfer(Server *s,const Node *archive,int fd,u64 restart) {
             ok=tar_chunk(&reader,m,&file,offset,&inside,&bytes);
             if(ok) {ok=tar_emit(&out,c->data+inside,bytes);offset+=bytes;}
         }
-        if(file) {if(c->functions->close_handle(file))ok=0;file=0;}
+        if(file.handle) {if(!close_reader_object(c,file))ok=0;file=(FsObject){0};}
         if(ok)ok=tar_emit(&out,0,tar_padded(m->size)-m->size);
     }
     if(ok)ok=tar_emit(&out,0,1024)&&tar_flush(&out)&&out.position==archive->size;
     const Source *source=c->sources+archive->mount;
-    if(reader.handle&&source->kind>=2&&c->functions->close_handle(reader.handle))ok=0;
+    if(reader.object.handle&&source->kind>=2&&!close_reader_object(c,reader.object))ok=0;
     return ok&&!c->stop;
 }

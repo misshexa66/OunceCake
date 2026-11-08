@@ -1,6 +1,6 @@
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
-const { success, pathRequest, idBytes, resultError, cleanup, closeHandles, throwIfCancelled } = require('./protocol.cjs');
+const { success, idBytes, resultError, cleanup, throwIfCancelled } = require('./protocol.cjs');
 const { discoverBase, discoverUpdates, discoverDlc, discoverDataPatches, resolveContent } = require('./content.cjs');
 const { createProgramMounts, prepareInstalledLicense } = require('./program.cjs');
 const { openDlcPatch } = require('./dlc.cjs');
@@ -17,13 +17,12 @@ function createGameFiles(attachment) {
   const { openCode, openUpdate, openManualPatch } = createProgramMounts(attachment);
   const originals = new Map();
   const originalManuals = new Map();
-  const { s, root, domain, filesystem, service } = attachment;
-
-  const send = async (label, handle, bytes) => success(await domain.send(s, label, handle, bytes), label);
+  const { s, root, domain, filesystem, service, fs: gameFs } = attachment;
 
   async function open({ title, storage, section = 'romfs', base, update, dlc, dataPatch, content }) {
     let source;
     let mounted;
+    let handle;
 
     try {
       source = await resolveContent({
@@ -41,10 +40,6 @@ function createGameFiles(attachment) {
       });
 
       const { contentPath, attributes } = source;
-      const filename = Buffer.alloc(0x301);
-      filename.write(contentPath);
-
-      let handle;
       let composed = false;
 
       const filesystemType = { meta: 5, logo: 2, control: 3, manual: 4, legal: 4 }[section];
@@ -67,9 +62,7 @@ function createGameFiles(attachment) {
         input[0] = attributes;
         input.writeUInt32LE(filesystemType, 4);
         idBytes(source.runtimeProgramId).copy(input, 8);
-        await s.write(s.base + 0x2000, filename);
-        handle = domain.oneHandle(await send('Open game ' + section, root,
-          pathRequest(10, input, s.base + 0x2000)));
+        handle = await gameFs.openPath(await gameFs.root(), 'Open game ' + section, 10, input, contentPath);
       } else if (dataPatch) {
         const originalContent = dataPatch.original.contents.find(item =>
           item.contentType === source.contentType && item.programIndex === source.programIndex);
@@ -93,16 +86,12 @@ function createGameFiles(attachment) {
         handle = await openCode({ title: source.runtimeProgramId, storage, attributes, source });
       } else {
         // base program archive uses type 1, other nca files (data) use 6
-        await s.write(s.base + 0x2000, filename);
-
         const input = Buffer.alloc(8);
         input[0] = attributes;
         source.proxyType = source.contentType === 2 ? 6 : 1;
         input.writeUInt32LE(source.proxyType, 4);
 
-        handle = domain.oneHandle(
-          await send('OpenDataStorageByPath', root, pathRequest(206, input, s.base + 0x2000)),
-        );
+        handle = await gameFs.openPath(await gameFs.root(), 'OpenDataStorageByPath', 206, input, contentPath);
       }
 
       mounted = {
@@ -114,8 +103,7 @@ function createGameFiles(attachment) {
       };
 
       if (mounted.kind === 'storage') {
-        const reply = success(await s.ipc('Game storage size', handle, 4), 'Game storage size');
-        mounted.size = safeSize(reply.data.readBigUInt64LE());
+        mounted.size = safeSize(await gameFs.size(handle));
       }
 
       if (base && source.contentType === 1) originals.set(source.programIndex, source);
@@ -124,7 +112,7 @@ function createGameFiles(attachment) {
     } catch (error) {
       if (source) error.source = source;
 
-      await cleanup([() => closeHandles(s, mounted ? [mounted.handle] : [])], error);
+      await cleanup([() => handle && gameFs.close(handle)], error);
     }
   }
 
@@ -133,9 +121,7 @@ function createGameFiles(attachment) {
     const mode = Buffer.alloc(4);
     mode.writeUInt32LE(3);
 
-    const handle = domain.oneHandle(
-      success(await filesystem.pathMethod(s, mount.handle, 9, path, mode), 'Open game directory'),
-    );
+    const handle = await gameFs.openPath(mount.handle, 'Open game directory', 9, mode, path);
     const entries = [];
 
     try {
@@ -144,12 +130,9 @@ function createGameFiles(attachment) {
           throw Object.assign(new Error('FTP preparation cancelled'), { code: 'FTP_CANCELLED' });
         }
 
-        const reply = success(
-          await s.ipc('Read game directory', handle, 0, Buffer.alloc(0), {
-            receive: [{ address: s.base + 0x6000, size: 32 * 0x310, mode: 0 }],
-          }),
-          'Read game directory',
-        );
+        const reply = await gameFs.call(handle, 'Read game directory', 0, Buffer.alloc(0), {
+          receive: [{ address: s.base + 0x6000, size: 32 * 0x310, mode: 0 }],
+        }, 8);
         const count = safeSize(reply.data.readBigUInt64LE());
 
         if (!count) return entries;
@@ -170,18 +153,18 @@ function createGameFiles(attachment) {
         }
       }
     } finally {
-      await s.close(handle);
+      await gameFs.close(handle);
     }
   }
 
   async function read(mount, offset, length) {
 
-    const bytes = length ? await filesystem.readStorage(s, mount.handle, offset, length) : Buffer.alloc(0);
+    const bytes = length ? await gameFs.read(mount.handle, offset, length) : Buffer.alloc(0);
     return bytes;
   }
 
   async function close(mount) {
-    await s.close(mount.handle);
+    await gameFs.close(mount.handle);
   }
 
   return {
@@ -628,8 +611,10 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
 
     if (deferred) await files.close(mounted);
 
+    const object = deferred ? await a.fs.root() : mounted.handle;
     sources.push({
-      handle: deferred ? a.root : mounted.handle,
+      handle: object.handle,
+      objectId: object.objectId,
       kind: deferredFilesystem ? 3 : deferredStorage ? 2 : mounted.kind === 'storage' ? 0 : 1,
       attributes: deferred ? mounted.source.attributes : undefined,
       proxyType: deferred ? mounted.source.proxyType : undefined,

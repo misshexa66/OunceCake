@@ -164,7 +164,7 @@ function encodeConfiguration({
 }) {
   const config = Buffer.alloc(256);
   config.write('NS2FTP01');
-  config.writeUInt32LE(1, 8);
+  config.writeUInt32LE(2, 8);
   config.writeUInt32LE(port, 24);
   config.writeUInt32LE(MAX_CLIENTS, 28);
 
@@ -184,17 +184,18 @@ function encodeConfiguration({
   pointer(232, slots);
   config.writeBigUInt64LE(BigInt(slotBytes), 240);
 
-  const table = Buffer.alloc(sources.length * 16);
+  const table = Buffer.alloc(sources.length * 24);
   sources.forEach((source, i) => {
-    table.writeUInt32LE(source.handle, i * 16);
-    table.writeUInt32LE(source.kind, i * 16 + 4);
+    table.writeUInt32LE(source.handle, i * 24);
+    table.writeUInt32LE(source.kind, i * 24 + 4);
 
     if (source.kind === 2 || source.kind === 3) {
-      table[i * 16 + 5] = source.attributes;
-      table[i * 16 + 6] = source.proxyType;
+      table[i * 24 + 5] = source.attributes;
+      table[i * 24 + 6] = source.proxyType;
     }
 
-    table.writeBigUInt64LE(source.kind === 3 ? BigInt('0x' + source.programId) : BigInt(source.size), i * 16 + 8);
+    table.writeBigUInt64LE(source.kind === 3 ? BigInt('0x' + source.programId) : BigInt(source.size), i * 24 + 8);
+    table.writeUInt32LE(source.objectId || 0, i * 24 + 16);
   });
 
   return { config, sources: table };
@@ -243,7 +244,7 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
 
   const indexOffset = 0x20000;
   const sourceOffset = align(indexOffset + index.length);
-  const dataOffset = align(sourceOffset + sources.length * 16);
+  const dataOffset = align(sourceOffset + sources.length * 24);
   const dataBytes = 0x400000;
   const outputBytes = index.readUInt32LE(8) === 2 ? OUTPUT_BYTES : 0;
   const slotsOffset = dataOffset + dataBytes;

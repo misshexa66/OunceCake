@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const net = require('node:net');
 const { success, cleanup } = require('./protocol.cjs');
+const { createFs } = require('./fs.cjs');
 
 function requestOnce(socketPath, command) {
   return new Promise((resolve, reject) => {
@@ -128,8 +129,10 @@ async function attachGame(run) {
       services.set(name, handle);
       return handle;
     }
-    return { s, root, domain, filesystem, service, run, live, Session, current, proof,
+    const attachment = { s, root, domain, filesystem, service, run, live, Session, current, proof,
       close: async () => { if (!s.threads.size) await s.cleanup(); } };
+    attachment.fs = createFs(attachment);
+    return attachment;
   } catch (error) {
     await cleanup([() => s.cleanup()], error);
   }

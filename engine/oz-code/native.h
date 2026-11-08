@@ -31,7 +31,9 @@ typedef struct {
 typedef struct {
     u32 handle; u8 kind, attributes, proxy_type, reserved;
     union {u64 size; u64 program_id;};
+    u32 object_id, padding;
 } Source;
+typedef struct {u32 handle, object_id;} FsObject;
 typedef struct {
     u32 parent, child, next, type, name_offset, name_length, mount, source_path;
     u64 offset, size;
@@ -62,7 +64,7 @@ typedef struct FtpConfigTag {
     struct FtpConfigTag *owner;
 } FtpConfig;
 _Static_assert(sizeof(Address) == 16 && sizeof(PollFd) == 8 && sizeof(Node) == 48, "wire ABI");
-_Static_assert(sizeof(Source) == 16, "source ABI");
+_Static_assert(sizeof(Source) == 24, "source ABI");
 _Static_assert(sizeof(TarMember) == 64, "tar member ABI");
 _Static_assert(__builtin_offsetof(FtpConfig, functions) == 64 && sizeof(FtpConfig) == 256, "configuration ABI");
 _Static_assert(__builtin_offsetof(FtpConfig, output_bytes) == 128 &&

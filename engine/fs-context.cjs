@@ -186,8 +186,7 @@ async function openProgramContent({ attachment: a, title, storage, policy, manua
       const input = Buffer.alloc(16);
       input.writeUInt32LE(4);
       idBytes(title).copy(input, 8);
-      return a.domain.oneHandle(success(await a.s.ipc('Open composed game manual', a.root, 7, input),
-        'Open composed game manual'));
+      return a.fs.open(await a.fs.root(), 'Open composed game manual', 7, input);
     }
     return openCurrentProgramRomfs({ attachment: a, reader, owner });
   }, async () => {
@@ -214,9 +213,9 @@ async function openCurrentProgramRomfs({ attachment: a, reader, owner }) {
 
   try {
     return await withCleanup(async () => {
-      client = await a.domain.openDomain(a.s, 'Owned update program FS');
+      client = await a.fs.program();
 
-      const entry = layout.table + (client.root - 1) * 0x30;
+      const entry = layout.table + (client.objectId - 1) * 0x30;
       const b = await memory.read(entry, 0x30);
       const domain = ptr(b, 0x18);
       const root = ptr(b, 0x20);
@@ -244,30 +243,11 @@ async function openCurrentProgramRomfs({ attachment: a, reader, owner }) {
         await memory.write(field.address, Buffer.from(field.original, 'hex'), u64(owner));
       }
 
-      const reply = await a.domain.send(
-        a.s,
-        'Open composed current-program RomFS',
-        client.handle,
-        a.domain.wire.domain(client.root, 200),
-        { domain: true },
-      );
-
-      if (reply.result) throw resultError('Open composed current-program RomFS', reply.result);
-
-      const copied = await a.domain.send(
-        a.s,
-        'Copy composed program storage',
-        client.handle,
-        a.domain.wire.control(1, u32(reply.objects[0])),
-      );
-
-      if (copied.result) throw resultError('Copy composed program storage', copied.result);
-
-      storage = a.domain.oneHandle(copied);
+      storage = await a.fs.open(client, 'Open composed current-program RomFS', 200);
       return storage;
-    }, () => restoreProgramRoot(memory, owner, fields), () => client && a.s.close(client.handle));
+    }, () => restoreProgramRoot(memory, owner, fields));
   } catch (error) {
-    await cleanup([() => storage && a.s.close(storage)], error);
+    await cleanup([() => storage && a.fs.close(storage)], error);
   }
 }
 

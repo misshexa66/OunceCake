@@ -8,7 +8,7 @@ async function openDlcPatch({ attachment: a, title, source, originalSource }) {
       (originalSource.dataPatchTitle && originalSource.dataPatchTitle !== source.contentTitle)) {
     throw new Error('DLC update does not match its original DLC');
   }
-  const { s, domain, service, root } = a;
+  const { s, domain, service } = a;
   const dataId = originalSource.runtimeProgramId || originalSource.contentTitle;
   const lr = await service('lr');
   const resolver = domain.oneHandle(success(await s.ipc('Open DLC resolver', lr, 3), 'Open DLC resolver'));
@@ -51,10 +51,7 @@ async function openDlcPatch({ attachment: a, title, source, originalSource }) {
       operation: async () => {
         const input = Buffer.alloc(16);
         idBytes(dataId).copy(input, 8);
-        return domain.oneHandle(success(
-          await s.ipc('Open patched DLC storage', root, 202, input),
-          'Open patched DLC storage',
-        ));
+        return a.fs.open(await a.fs.root(), 'Open patched DLC storage', 202, input);
       },
     });
   }, async () => {

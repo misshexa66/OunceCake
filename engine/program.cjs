@@ -443,14 +443,14 @@ async function withManualPaths({ attachment: a, title, source, originalSource, p
 }
 
 function createProgramMounts(attachment) {
-  const { s, domain, filesystem, service, run, live, current } = attachment;
+  const { s, domain, fs: gameFs, run, live } = attachment;
   const engine = path.join(run, 'switch2');
   const read = (file) => fs.readFile(file, 'utf8').then(JSON.parse);
   let loader;
   const openCodeRaw = async ({ title, storage, attributes }) => {
     if (!loader) {
       const evidence = await read(path.join(engine, 'ro', live.session + '-loader-root-copy.json'));
-      loader = domain.oneHandle(
+      const handle = domain.oneHandle(
         await domain.send(
           s,
           'Clone held loader root for game CodeFS',
@@ -458,6 +458,8 @@ function createProgramMounts(attachment) {
           domain.wire.control(2),
         ),
       );
+      try { loader = await gameFs.convert(handle, 'Convert game CodeFS loader'); }
+      catch (error) { await cleanup([() => s.close(handle)], error); }
     }
 
     const input = Buffer.alloc(16);
@@ -468,15 +470,9 @@ function createProgramMounts(attachment) {
     const size = 0x1a4;
     const address = s.base + 0x4000;
 
-    const reply = await s.ipc('Open selected game CodeFS', loader, 0, input, {
+    return gameFs.open(loader, 'Open selected game CodeFS', 0, input, {
       receive: [{ address, size, mode: 0 }],
     });
-
-    if (reply.result) {
-      throw resultError('Open selected game CodeFS', reply.result);
-    }
-
-    return domain.oneHandle(reply);
   };
 
   const openCode = (args) => args.source.programIndex || args.source.selection === 'dlc' ? selectPatch({
@@ -493,12 +489,14 @@ function createProgramMounts(attachment) {
   }) : openCodeRaw(args);
 
   const readPolicy = code => withCleanup(async () => {
-    const file = success(await filesystem.openFile(s, code, '/main.npdm'), 'Open program policy');
+    const mode = Buffer.alloc(4);
+    mode.writeUInt32LE(1);
+    const file = await gameFs.openPath(code, 'Open program policy', 8, mode, '/main.npdm');
     return withCleanup(async () => {
-      const size = Number(await filesystem.fileSize(s, file.handle));
-      return filesystem.readFile(s, file.handle, 0, size);
-    }, () => s.close(file.handle));
-  }, () => s.close(code));
+      const size = Number(await gameFs.size(file));
+      return gameFs.read(file, 0, size, true);
+    }, () => gameFs.close(file));
+  }, () => gameFs.close(code));
 
   const openUpdate = (args) => selectPatch({
     attachment,
@@ -548,7 +546,7 @@ function createProgramMounts(attachment) {
             return handle;
           } }) });
     } catch (error) {
-      await cleanup([() => handle && s.close(handle)], error);
+      await cleanup([() => handle && gameFs.close(handle)], error);
     }
   };
   return { openCode, openUpdate, openManualPatch };
