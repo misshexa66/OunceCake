@@ -723,7 +723,7 @@ async function prepareGame({ attachment: a, title, shouldStop = () => false, tar
           unavailableBaseSections.push({ path: path + '/' + section, section, source,
             reason: mounted.reason });
           console.log('Can\'t mount ' + path + '/' + section +
-            ', checking if there\'s an upadte...');
+            ', checking if there\'s an update...');
         }
         choices = choices.filter(candidate => candidate.storage === mounted.source.storage);
       }
